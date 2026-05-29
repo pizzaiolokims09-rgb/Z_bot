@@ -79,8 +79,11 @@ class OrderExecutor:
             })
             
             if USE_TESTNET:
-                self._exchange.set_sandbox_mode(True)
-                logger.info("[실거래] 바이낸스 모의투자(Testnet) 모드 활성화")
+                # 최신 CCXT에서 binanceusdm 샌드박스 모드가 deprecated 되어 수동으로 API URL 변경
+                self._exchange.urls['api']['fapiPublic'] = 'https://testnet.binancefuture.com/fapi/v1'
+                self._exchange.urls['api']['fapiPrivate'] = 'https://testnet.binancefuture.com/fapi/v1'
+                self._exchange.urls['api']['fapiV2'] = 'https://testnet.binancefuture.com/fapi/v2'
+                logger.info("[실거래] 바이낸스 모의투자(Testnet) 모드 활성화 (수동 URL 패치)")
             else:
                 logger.info("[실거래] 바이낸스 실거래(Mainnet) 모드 활성화")
 
