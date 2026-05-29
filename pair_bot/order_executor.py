@@ -8,7 +8,7 @@
 import asyncio
 import logging
 from config import (
-    API_KEY, API_SECRET, IS_PAPER_TRADING,
+    API_KEY, API_SECRET, IS_PAPER_TRADING, USE_TESTNET,
     PAIRS_TO_TRADE, LEVERAGE,
     ORDER_RETRY_COUNT, ORDER_RETRY_WAIT,
     PAPER_INITIAL_BALANCE, ALLOCATION_PER_PAIR,
@@ -77,6 +77,13 @@ class OrderExecutor:
                 "options"        : {"defaultType": "future"},
                 "enableRateLimit": True,
             })
+            
+            if USE_TESTNET:
+                self._exchange.set_sandbox_mode(True)
+                logger.info("[실거래] 바이낸스 모의투자(Testnet) 모드 활성화")
+            else:
+                logger.info("[실거래] 바이낸스 실거래(Mainnet) 모드 활성화")
+
             for sym_a, sym_b in PAIRS_TO_TRADE:
                 for sym in (sym_a + ":USDT", sym_b + ":USDT"):
                     try:

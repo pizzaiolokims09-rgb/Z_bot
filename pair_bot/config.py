@@ -18,10 +18,16 @@ API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "")
 
-# ── 페이퍼 트레이딩 모드 ────────────────────────────────────────────────────
-# True : 실제 주문 없이 가상 시뮬레이션
-# False: 실제 바이낸스 선물 주문 집행
+# ── 거래 모드 및 모의투자(Testnet) ──────────────────────────────────────────
+# IS_PAPER_TRADING
+#   True : API 연결 없이 내부에서 가상 잔고로만 시뮬레이션 (안전)
+#   False: 실제 바이낸스 거래소로 주문 집행 (아래 USE_TESTNET에 따라 실거래/모의투자 결정)
 IS_PAPER_TRADING = os.getenv("IS_PAPER_TRADING", "true").lower() == "true"
+
+# USE_TESTNET (IS_PAPER_TRADING이 False일 때만 유효)
+#   True : 바이낸스 모의투자(Testnet) 네트워크 사용
+#   False: 바이낸스 실거래(Mainnet) 네트워크 사용
+USE_TESTNET = os.getenv("USE_TESTNET", "true").lower() == "true"
 
 # ── 거래 대상 페어 목록 (A심볼, B심볼) ──────────────────────────────────────
 # 바이낸스 선물 표기법: spot 심볼로 입력하면 내부에서 :USDT 변환
