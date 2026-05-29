@@ -1,6 +1,6 @@
 # =============================================================================
 # pair_bot/main.py
-# 페어 트레이딩 봇 — 메인 진입점 (5개 페어 병렬 감시)
+# 페어 트레이딩 봇 — 메인 진입점 (5개 페어 병렬 감시 + 텔레그램 연동)
 # 실행: python main.py
 # =============================================================================
 
@@ -15,12 +15,15 @@ import ccxt.async_support as ccxt_async
 
 from config import (
     IS_PAPER_TRADING, PAIRS_TO_TRADE,
-    ALLOCATION_PER_PAIR,
+    ALLOCATION_PER_PAIR, LEVERAGE,
     POLL_INTERVAL_SEC, LOG_FILE,
+    TELEGRAM_BOT_TOKEN,
 )
-from spread_engine  import SpreadEngine
-from risk_manager   import RiskManager
-from order_executor import OrderExecutor
+from spread_engine   import SpreadEngine
+from risk_manager    import RiskManager
+from order_executor  import OrderExecutor
+from bot_state       import BotState, PairPosition
+from telegram_bot    import TelegramNotifier
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -42,7 +45,9 @@ def setup_logger() -> logging.Logger:
     ch.setFormatter(fmt)
 
     # 파일 출력 (최대 10MB, 3개 롤링)
-    fh = RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    fh = RotatingFileHandler(
+        LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
 
@@ -84,13 +89,64 @@ async def fetch_mid_price(exchange: ccxt_async.Exchange, symbol: str) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 단일 페어 감시 루프 (Z-Score/진입/청산 핵심 로직 유지)
+# 청산 공통 처리 (익절 / 손절 / 수동 — 코드 중복 방지)
+# ─────────────────────────────────────────────────────────────────────────────
+async def _execute_close(
+    prefix: str,
+    reason: str,
+    price_a: float,
+    price_b: float,
+    sym_a: str,
+    sym_b: str,
+    risk_manager: RiskManager,
+    order_executor: OrderExecutor,
+    bot_state: BotState,
+    notifier: TelegramNotifier,
+    logger: logging.Logger,
+    dev: float,
+):
+    """청산 주문 → PnL 계산 → 상태 정리 → 텔레그램 알림을 한 번에 처리합니다."""
+    pos = bot_state.positions.get(prefix)
+
+    # PnL 계산 (진입 정보가 있을 때만)
+    pnl_usdt, pnl_pct = 0.0, 0.0
+    if pos:
+        pnl_usdt, pnl_pct = bot_state.calc_pnl(pos, price_a, price_b, LEVERAGE)
+        bot_state.record_trade(pnl_usdt)
+        bot_state.positions.pop(prefix, None)
+
+    if reason == "STOP_LOSS":
+        logger.warning(
+            f"[{prefix}] 손절 발동 | dev={dev:+.3f}% >= 임계값 — 전량 청산 | "
+            f"추정PnL={pnl_usdt:+.4f} USDT"
+        )
+    elif reason == "MANUAL":
+        logger.info(f"[{prefix}] 수동 청산 실행 | 추정PnL={pnl_usdt:+.4f} USDT")
+    else:
+        logger.info(
+            f"[{prefix}] 익절 발동 | 괴리 회귀 | dev={dev:+.3f}% | "
+            f"추정PnL={pnl_usdt:+.4f} USDT ({pnl_pct:+.3f}%)"
+        )
+
+    await order_executor.close_pair(
+        sym_a=sym_a, price_a=price_a,
+        sym_b=sym_b, price_b=price_b,
+        reason=reason, pair_prefix=prefix,
+    )
+    risk_manager.close_position(prefix)
+    await notifier.send_exit(prefix, pnl_usdt, pnl_pct, reason)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 단일 페어 감시 루프 (Z-Score / 진입 / 청산 핵심 로직 유지)
 # ─────────────────────────────────────────────────────────────────────────────
 async def pair_loop(
     raw_sym_a: str,
     raw_sym_b: str,
     exchange: ccxt_async.Exchange,
     order_executor: OrderExecutor,
+    bot_state: BotState,
+    notifier: TelegramNotifier,
 ):
     """
     한 페어에 대한 독립적인 감시/매매 루프.
@@ -108,6 +164,19 @@ async def pair_loop(
 
     while True:
         try:
+            # ── 0. 수동 청산 요청 확인 (텔레그램 버튼) ──────────────────────
+            if prefix in bot_state.manual_close_requests:
+                bot_state.manual_close_requests.discard(prefix)
+                if risk_manager.has_position:
+                    prices = bot_state.latest_price.get(prefix, (0.0, 0.0))
+                    await _execute_close(
+                        prefix, "MANUAL", prices[0], prices[1],
+                        sym_a, sym_b, risk_manager, order_executor,
+                        bot_state, notifier, logger, 0.0,
+                    )
+                await asyncio.sleep(POLL_INTERVAL_SEC)
+                continue
+
             # ── 1. 가격 조회 ────────────────────────────────────────────────
             price_a, price_b = await asyncio.gather(
                 fetch_mid_price(exchange, sym_a),
@@ -119,16 +188,24 @@ async def pair_loop(
                 await asyncio.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            # ── 2. 스프레드 계산 (이동평균 / Z-Score — 기존 로직 유지) ────────
+            # 공유 상태 업데이트 (텔레그램 Status 명령에서 사용)
+            bot_state.latest_price[prefix] = (price_a, price_b)
+
+            # ── 2. 스프레드 계산 (이동평균 / Z-Score 핵심 로직 유지) ─────────
             state  = spread_engine.update(price_a, price_b)
             signal = state["signal"]
             dev    = state["dev_pct"]
             ratio  = state["ratio"]
             window = spread_engine.window_size
 
-            # 주기적 상태 로그 (10초마다 DEBUG 레벨로 bot.log에 기록)
+            bot_state.latest_dev[prefix] = dev
+
+            # 주기적 상태 로그 (10초마다 DEBUG → bot.log에 기록)
             if int(time.time()) % 10 == 0:
-                pnl_est = risk_manager.estimate_pnl_pct(ratio) if risk_manager.has_position else 0.0
+                pnl_est = (
+                    risk_manager.estimate_pnl_pct(ratio)
+                    if risk_manager.has_position else 0.0
+                )
                 logger.debug(
                     f"[{prefix}] ratio={ratio:.6f} | dev={dev:+.3f}% | "
                     f"z={state['z_score']:+.3f} | window={window} | "
@@ -136,12 +213,16 @@ async def pair_loop(
                     f"추정PnL={pnl_est:+.3f}%"
                 )
 
-            # ── 3. 동적 포지션 사이징 — 가용 잔고의 ALLOCATION_PER_PAIR% ──────
-            # 진입 신호가 있을 때만 잔고 조회 (불필요한 API 호출 최소화)
+            # ── 3. 동적 포지션 사이징 — 가용 잔고의 14% (핵심 자금 관리 유지) ─
             trade_usdt = 0.0
             if not risk_manager.has_position and signal.startswith("ENTRY"):
+                # 봇 정지 상태면 진입 스킵 (기존 포지션 관리는 계속)
+                if not bot_state.is_accepting_entries:
+                    await asyncio.sleep(POLL_INTERVAL_SEC)
+                    continue
+
                 free_bal   = await order_executor.get_free_balance()
-                # 페어 총 배분 = 잔고 x 10%, 각 레그(롱/숏) = 그 절반
+                # 페어 총 배분 = 잔고 x 14%, 각 레그(롱/숏) = 그 절반 (7%)
                 trade_usdt = (free_bal * ALLOCATION_PER_PAIR) / 2.0
                 logger.info(
                     f"[{prefix}] 잔고={free_bal:.2f} USDT | "
@@ -153,43 +234,59 @@ async def pair_loop(
             if not risk_manager.has_position:
                 if signal == "ENTRY_SHORT_A_LONG_B" and trade_usdt > 0:
                     sizing = risk_manager.calc_qty(price_a, price_b, trade_usdt)
-                    logger.info(f"[{prefix}] 진입 시그널 발생 | A Short / B Long | dev={dev:+.3f}%")
+                    logger.info(
+                        f"[{prefix}] 진입 시그널 발생 | A Short / B Long | dev={dev:+.3f}%"
+                    )
                     await order_executor.open_pair(
                         sym_a=sym_a, side_a="sell", qty_a=sizing["qty_a"], price_a=price_a,
                         sym_b=sym_b, side_b="buy",  qty_b=sizing["qty_b"], price_b=price_b,
                         pair_prefix=prefix,
                     )
                     risk_manager.open_position("SHORT_A_LONG_B", ratio, trade_usdt, prefix)
+                    bot_state.positions[prefix] = PairPosition(
+                        prefix=prefix, side="SHORT_A_LONG_B",
+                        entry_ratio=ratio, sym_a=sym_a, sym_b=sym_b,
+                        price_a=price_a, price_b=price_b, trade_usdt=trade_usdt,
+                    )
+                    await notifier.send_entry(
+                        prefix, sym_a, "sell", price_a, sym_b, "buy", price_b, trade_usdt
+                    )
 
                 elif signal == "ENTRY_LONG_A_SHORT_B" and trade_usdt > 0:
                     sizing = risk_manager.calc_qty(price_a, price_b, trade_usdt)
-                    logger.info(f"[{prefix}] 진입 시그널 발생 | A Long / B Short | dev={dev:+.3f}%")
+                    logger.info(
+                        f"[{prefix}] 진입 시그널 발생 | A Long / B Short | dev={dev:+.3f}%"
+                    )
                     await order_executor.open_pair(
                         sym_a=sym_a, side_a="buy",  qty_a=sizing["qty_a"], price_a=price_a,
                         sym_b=sym_b, side_b="sell", qty_b=sizing["qty_b"], price_b=price_b,
                         pair_prefix=prefix,
                     )
                     risk_manager.open_position("LONG_A_SHORT_B", ratio, trade_usdt, prefix)
+                    bot_state.positions[prefix] = PairPosition(
+                        prefix=prefix, side="LONG_A_SHORT_B",
+                        entry_ratio=ratio, sym_a=sym_a, sym_b=sym_b,
+                        price_a=price_a, price_b=price_b, trade_usdt=trade_usdt,
+                    )
+                    await notifier.send_entry(
+                        prefix, sym_a, "buy", price_a, sym_b, "sell", price_b, trade_usdt
+                    )
 
             else:
+                # 청산 / 손절 판단 — 공통 핸들러로 위임
                 if signal == "STOP" or risk_manager.should_stop_loss(dev):
-                    logger.warning(f"[{prefix}] 손절 발동 | dev={dev:+.3f}% >= 임계값 — 전량 청산")
-                    await order_executor.close_pair(
-                        sym_a=sym_a, price_a=price_a,
-                        sym_b=sym_b, price_b=price_b,
-                        reason="STOP_LOSS", pair_prefix=prefix,
+                    await _execute_close(
+                        prefix, "STOP_LOSS", price_a, price_b,
+                        sym_a, sym_b, risk_manager, order_executor,
+                        bot_state, notifier, logger, dev,
                     )
-                    risk_manager.close_position(prefix)
 
                 elif signal == "EXIT":
-                    pnl_est = risk_manager.estimate_pnl_pct(ratio)
-                    logger.info(f"[{prefix}] 익절 발동 | 괴리 회귀 | dev={dev:+.3f}% | 추정PnL={pnl_est:+.3f}%")
-                    await order_executor.close_pair(
-                        sym_a=sym_a, price_a=price_a,
-                        sym_b=sym_b, price_b=price_b,
-                        reason="TAKE_PROFIT", pair_prefix=prefix,
+                    await _execute_close(
+                        prefix, "TAKE_PROFIT", price_a, price_b,
+                        sym_a, sym_b, risk_manager, order_executor,
+                        bot_state, notifier, logger, dev,
                     )
-                    risk_manager.close_position(prefix)
 
             # ── 5. 다음 사이클 대기 ──────────────────────────────────────────
             await asyncio.sleep(POLL_INTERVAL_SEC)
@@ -208,7 +305,7 @@ async def pair_loop(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 메인 루프 — 5개 페어 병렬 실행
+# 메인 루프 — 5개 페어 병렬 + 텔레그램 앱 동시 실행
 # ─────────────────────────────────────────────────────────────────────────────
 async def main_loop():
     logger = logging.getLogger("pair_bot")
@@ -218,17 +315,30 @@ async def main_loop():
     logger.info(f"  페어 트레이딩 봇 시작 — 모드: {mode_str}")
     logger.info(f"  감시 페어 수: {len(PAIRS_TO_TRADE)}개")
     for sym_a, sym_b in PAIRS_TO_TRADE:
-        logger.info(f"    [{make_prefix(sym_a, sym_b):10s}]  {sym_a}  /  {sym_b}")
+        logger.info(f"    [{make_prefix(sym_a, sym_b):12s}]  {sym_a}  /  {sym_b}")
     logger.info(f"  페어당 배분 비율: {ALLOCATION_PER_PAIR * 100:.0f}%")
     logger.info("=" * 60)
 
-    # ccxt 비동기 교환소 (가격 조회용 — 공개 API, 키 불필요)
+    # 공유 상태 & 실행 객체 초기화
+    bot_state      = BotState()
     exchange       = ccxt_async.binanceusdm({"options": {"defaultType": "future"}})
     order_executor = OrderExecutor()
+    notifier       = TelegramNotifier(bot_state, order_executor)
 
-    # 5개 페어 루프를 asyncio.gather로 동시 병렬 실행
+    # ── 텔레그램 봇 시작 ────────────────────────────────────────────────────
+    tg_app = None
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != "YOUR_TELEGRAM_BOT_TOKEN":
+        tg_app = notifier.build_app()
+        await tg_app.initialize()
+        await tg_app.start()
+        await tg_app.updater.start_polling()
+        logger.info("[텔레그램] 봇 폴링 시작")
+    else:
+        logger.warning("[텔레그램] 토큰 미설정 — 텔레그램 기능 비활성화")
+
+    # ── 5개 페어 루프 병렬 실행 ─────────────────────────────────────────────
     tasks = [
-        pair_loop(sym_a, sym_b, exchange, order_executor)
+        pair_loop(sym_a, sym_b, exchange, order_executor, bot_state, notifier)
         for sym_a, sym_b in PAIRS_TO_TRADE
     ]
 
@@ -237,6 +347,10 @@ async def main_loop():
     except KeyboardInterrupt:
         pass
     finally:
+        if tg_app:
+            await tg_app.updater.stop()
+            await tg_app.stop()
+            await tg_app.shutdown()
         await exchange.close()
         logger.info("교환소 연결 종료. 봇을 정상적으로 종료합니다.")
 

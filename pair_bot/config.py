@@ -1,26 +1,36 @@
 # =============================================================================
 # pair_bot/config.py
-# 페어 트레이딩 봇 — 모든 설정값 관리 파일
-# 여기 값만 바꾸면 봇 동작이 바뀝니다.
+# 모든 설정값 관리 파일
+# 민감 정보(API키, 토큰 등)는 .env 파일에서 읽어옵니다.
+# 매매 전략 파라미터는 이 파일 하단에서 직접 수정하세요.
 # =============================================================================
 
-# ── API 키 ─────────────────────────────────────────────────────────────────
-API_KEY    = "YOUR_BINANCE_API_KEY"
-API_SECRET = "YOUR_BINANCE_API_SECRET"
+import os
+from dotenv import load_dotenv
+
+# 이 파일 기준으로 .env 탐색 (pair_bot/.env 또는 부모 폴더까지 자동 탐색)
+load_dotenv()
+
+# ── 민감 정보 (.env에서 로드) ────────────────────────────────────────────────
+API_KEY    = os.getenv("BINANCE_API_KEY",    "")
+API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "")
 
 # ── 페이퍼 트레이딩 모드 ────────────────────────────────────────────────────
 # True : 실제 주문 없이 가상 시뮬레이션
 # False: 실제 바이낸스 선물 주문 집행
-IS_PAPER_TRADING = True
+IS_PAPER_TRADING = os.getenv("IS_PAPER_TRADING", "true").lower() == "true"
 
-# ── 거래 대상 페어 목록 (A심볼, B심볼) ─────────────────────────────────────
+# ── 거래 대상 페어 목록 (A심볼, B심볼) ──────────────────────────────────────
 # 바이낸스 선물 표기법: spot 심볼로 입력하면 내부에서 :USDT 변환
 PAIRS_TO_TRADE = [
-    ("BTC/USDT", "ETH/USDT"),
-    ("SOL/USDT", "AVAX/USDT"),
-    ("XRP/USDT", "ADA/USDT"),
-    ("DOGE/USDT", "1000SHIB/USDT"),
-    ("LINK/USDT", "DOT/USDT"),
+    ("BTC/USDT",      "ETH/USDT"),
+    ("SOL/USDT",      "AVAX/USDT"),
+    ("XRP/USDT",      "ADA/USDT"),
+    ("DOGE/USDT",     "1000SHIB/USDT"),
+    ("LINK/USDT",     "DOT/USDT"),
 ]
 
 # ── 레버리지 ────────────────────────────────────────────────────────────────
