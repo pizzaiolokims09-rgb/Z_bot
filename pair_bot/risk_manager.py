@@ -4,7 +4,7 @@
 # =============================================================================
 
 import logging
-from config import TRADE_USDT, LEVERAGE, STOP_LOSS_PCT
+from config import LEVERAGE, STOP_LOSS_PCT
 
 logger = logging.getLogger("pair_bot")
 
@@ -29,20 +29,21 @@ class RiskManager:
 
     # ── 수량 계산 ─────────────────────────────────────────────────────────────
 
-    def calc_qty(self, price_a: float, price_b: float) -> dict:
+    def calc_qty(self, price_a: float, price_b: float, trade_usdt: float) -> dict:
         """
-        TRADE_USDT 설정값 기준으로 달러 중립 수량을 계산합니다.
+        trade_usdt 기준으로 달러 중립 수량을 계산합니다.
 
+        trade_usdt: 한 레그에 투입할 증거금(USDT) — 계좌 잔고 x ALLOCATION_PER_PAIR / 2
         반환값:
             {
-                "qty_a"        : float,  SOL 수량
-                "qty_b"        : float,  AVAX 수량
+                "qty_a"        : float,  A 코인 수량
+                "qty_b"        : float,  B 코인 수량
                 "notional_a"   : float,  A 명목가치(USDT)
                 "notional_b"   : float,  B 명목가치(USDT)
                 "margin_each"  : float,  레그당 증거금(USDT)
             }
         """
-        notional = TRADE_USDT * LEVERAGE   # 레버리지 적용 명목가치
+        notional = trade_usdt * LEVERAGE   # 레버리지 적용 명목가치
         qty_a = notional / price_a
         qty_b = notional / price_b
 
@@ -51,21 +52,21 @@ class RiskManager:
             "qty_b"      : qty_b,
             "notional_a" : qty_a * price_a,
             "notional_b" : qty_b * price_b,
-            "margin_each": TRADE_USDT,     # 각 레그의 증거금(= TRADE_USDT)
+            "margin_each": trade_usdt,
         }
 
     # ── 포지션 상태 기록/해제 ─────────────────────────────────────────────────
 
-    def open_position(self, side: str, entry_ratio: float):
+    def open_position(self, side: str, entry_ratio: float, trade_usdt: float, pair_prefix: str = ""):
         """진입 시 포지션 상태를 기록합니다."""
         self.position_side  = side
         self.entry_ratio    = entry_ratio
-        self.entry_notional = TRADE_USDT
-        logger.info(f"[포지션 열림] side={side}, entry_ratio={entry_ratio:.6f}")
+        self.entry_notional = trade_usdt
+        logger.info(f"[{pair_prefix}] [포지션 열림] side={side}, entry_ratio={entry_ratio:.6f}, margin={trade_usdt:.2f}USDT")
 
-    def close_position(self):
+    def close_position(self, pair_prefix: str = ""):
         """청산/손절 후 포지션 상태를 초기화합니다."""
-        logger.info(f"[포지션 닫힘] side={self.position_side}, entry_ratio={self.entry_ratio:.6f}")
+        logger.info(f"[{pair_prefix}] [포지션 닫힘] side={self.position_side}, entry_ratio={self.entry_ratio:.6f}")
         self.position_side  = None
         self.entry_ratio    = None
         self.entry_notional = 0.0
