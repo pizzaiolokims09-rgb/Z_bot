@@ -20,6 +20,7 @@ from config import (
     TELEGRAM_BOT_TOKEN, MAX_DRAWDOWN_LIMIT,
     API_KEY, API_SECRET, USE_TESTNET,
     MAX_BTC_VOLATILITY, BTC_VOLATILITY_CHECK_INTERVAL,
+    STOP_LOSS_COOLDOWN_SEC,
 )
 from spread_engine      import SpreadEngine
 from risk_manager       import RiskManager
@@ -299,6 +300,7 @@ async def pair_loop(
     spread_engine = SpreadEngine()   # 이 페어 전용 Z-Score 계산기
     risk_manager  = RiskManager()    # 이 페어 전용 포지션 상태
 
+    last_stop_loss_time = 0.0  # 마지막 손절 발생 시각 (time.time())
     reconnect_wait = 5
 
     while True:
@@ -362,6 +364,16 @@ async def pair_loop(
 
                 # BTC 시장 폭주 감지 시 신규 진입 차단 (청산 감시는 통과)
                 if bot_state.market_turbulent:
+                    await asyncio.sleep(POLL_INTERVAL_SEC)
+                    continue
+
+                # 손절 후 재진입 쿨다운 (진입→손절 무한루프 방지)
+                elapsed = time.time() - last_stop_loss_time
+                if elapsed < STOP_LOSS_COOLDOWN_SEC:
+                    remaining = int(STOP_LOSS_COOLDOWN_SEC - elapsed)
+                    logger.debug(
+                        f"[{prefix}] 손절 쿨다운 중 — 재진입까지 {remaining}초 남음"
+                    )
                     await asyncio.sleep(POLL_INTERVAL_SEC)
                     continue
 
@@ -466,6 +478,7 @@ async def pair_loop(
                         bot_state, notifier, logger, dev,
                         z_score=state["z_score"],
                     )
+                    last_stop_loss_time = time.time()  # 쿨다운 타이머 시작
 
                 elif signal == "EXIT":
                     # 익절 안전장치: Net PnL 산정 후 0 초과 시에만 청산
