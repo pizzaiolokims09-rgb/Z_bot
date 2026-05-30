@@ -27,3 +27,7 @@ __pycache__/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Bot Data & State
+*.csv
+bot_state.json

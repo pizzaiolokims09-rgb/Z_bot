@@ -166,8 +166,8 @@ class OrderExecutor:
             )
             return float(bal.get("total", {}).get("USDT", 0.0))
         except Exception as e:
-            logger.warning(f"[총잔고조회 실패] {e} — 0 반환")
-            return 0.0
+            logger.warning(f"[총잔고조회 실패] {e} — 일시적 통신 오류이므로 킬스위치 판정을 보류합니다.")
+            return None
 
     # ── 공개 API ──────────────────────────────────────────────────────────────
 

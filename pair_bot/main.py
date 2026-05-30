@@ -239,6 +239,9 @@ async def check_kill_switch(
         return
 
     current_bal = await order_executor.get_total_balance()
+    if current_bal is None:
+        return  # 네트워크 오류 등으로 잔고 조회를 실패한 경우 킬스위치 판정 보류
+
     drawdown = (current_bal - bot_state.initial_balance) / bot_state.initial_balance
 
     if drawdown > MAX_DRAWDOWN_LIMIT:
