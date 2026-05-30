@@ -471,7 +471,9 @@ async def pair_loop(
 
             elif risk_manager.has_position:
                 # 청산 / 손절 판단 — 공통 핸들러로 위임 (포지션 보유 시에만 진입)
-                if signal == "STOP" or risk_manager.should_stop_loss(dev):
+                # 손절은 Z-Score STOP 시그널(abs_z >= 4.0)에만 의존
+                # (레거시 dev% 기반 should_stop_loss는 Z-Score 진입과 충돌하므로 제거됨)
+                if signal == "STOP":
                     await _execute_close(
                         prefix, "STOP_LOSS", price_a, price_b,
                         sym_a, sym_b, risk_manager, order_executor,
