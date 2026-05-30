@@ -285,6 +285,7 @@ async def pair_loop(
     order_executor: OrderExecutor,
     bot_state: BotState,
     notifier: TelegramNotifier,
+    entry_lock: asyncio.Lock,
 ):
     """
     한 페어에 대한 독립적인 감시/매매 루프.
@@ -364,85 +365,97 @@ async def pair_loop(
                     await asyncio.sleep(POLL_INTERVAL_SEC)
                     continue
 
-                # 슬롯 제한: 동시 포지션 수가 MAX_ACTIVE_PAIRS 이상이면 신규 진입 스킵
-                active_count = len(bot_state.positions)
-                if active_count >= MAX_ACTIVE_PAIRS:
-                    logger.debug(
-                        f"[{prefix}] 슬롯 꼽 차서 진입 스킵 (활성={active_count}/{MAX_ACTIVE_PAIRS})"
-                    )
+                # 1단계 슬롯 체크 (락 가볍게 획득 후 바로 해제)
+                should_skip = False
+                async with entry_lock:
+                    if len(bot_state.positions) >= MAX_ACTIVE_PAIRS:
+                        logger.debug(
+                            f"[{prefix}] 슬롯 꽉 차서 진입 스킵 (활성={len(bot_state.positions)}/{MAX_ACTIVE_PAIRS})"
+                        )
+                        should_skip = True
+
+                if should_skip:
                     await asyncio.sleep(POLL_INTERVAL_SEC)
                     continue
 
-                free_bal   = await order_executor.get_free_balance()
-                # 페어 총 배분 = 잔고 x 14%, 각 레그(롱/숏) = 그 절반 (7%)
-                trade_usdt = (free_bal * ALLOCATION_PER_PAIR) / 2.0
-                logger.info(
-                    f"[{prefix}] 잔고={free_bal:.2f} USDT | "
-                    f"레그당={trade_usdt:.2f} USDT (배분={ALLOCATION_PER_PAIR * 100:.0f}%)"
-                )
-
-            # ── 4. 신호 처리 (기존 진입/청산 조건 로직 유지) ─────────────────
-
-            if not risk_manager.has_position:
-                if signal == "ENTRY_SHORT_A_LONG_B" and trade_usdt > 0:
-                    sizing = risk_manager.calc_qty(price_a, price_b, trade_usdt)
-                    logger.info(
-                        f"[{prefix}] 진입 시그널 발생 | A Short / B Long | "
-                        f"z={state['z_score']:+.3f} dev={dev:+.3f}%"
-                    )
-                    try:
-                        await order_executor.open_pair(
-                            sym_a=sym_a, side_a="sell", qty_a=sizing["qty_a"], price_a=price_a,
-                            sym_b=sym_b, side_b="buy",  qty_b=sizing["qty_b"], price_b=price_b,
-                            pair_prefix=prefix,
+                # 2단계 실제 진입 주문 실행 (주문 완료 및 bot_state.positions 등록 완료 시까지 락 점유)
+                async with entry_lock:
+                    # 락 획득 시점 재검증
+                    if len(bot_state.positions) >= MAX_ACTIVE_PAIRS:
+                        logger.debug(
+                            f"[{prefix}] 진입 직전 슬롯 포화 감지 (활성={len(bot_state.positions)}/{MAX_ACTIVE_PAIRS})"
                         )
-                    except LeggingError as e:
-                        logger.error(f"[{prefix}] {e} — 포지션 미기록")
-                        await notifier.send_legging_alert(prefix, str(e))
                         await asyncio.sleep(POLL_INTERVAL_SEC)
                         continue
-                    risk_manager.open_position("SHORT_A_LONG_B", ratio, trade_usdt, prefix)
-                    bot_state.positions[prefix] = PairPosition(
-                        prefix=prefix, side="SHORT_A_LONG_B",
-                        entry_ratio=ratio, sym_a=sym_a, sym_b=sym_b,
-                        price_a=price_a, price_b=price_b, trade_usdt=trade_usdt,
-                        entry_time=_now_kst(),
-                        entry_z_score=state["z_score"],
-                    )
-                    await notifier.send_entry(
-                        prefix, sym_a, "sell", price_a, sym_b, "buy", price_b, trade_usdt
-                    )
-                    await save_state(bot_state)  # 진입 직후 상태 저장
 
-                elif signal == "ENTRY_LONG_A_SHORT_B" and trade_usdt > 0:
-                    sizing = risk_manager.calc_qty(price_a, price_b, trade_usdt)
+                    free_bal   = await order_executor.get_free_balance()
+                    # 페어 총 배분 = 잔고 x 14%, 각 레그(롱/숏) = 그 절반 (7%)
+                    trade_usdt = (free_bal * ALLOCATION_PER_PAIR) / 2.0
                     logger.info(
-                        f"[{prefix}] 진입 시그널 발생 | A Long / B Short | "
-                        f"z={state['z_score']:+.3f} dev={dev:+.3f}%"
+                        f"[{prefix}] 잔고={free_bal:.2f} USDT | "
+                        f"레그당={trade_usdt:.2f} USDT (배분={ALLOCATION_PER_PAIR * 100:.0f}%)"
                     )
-                    try:
-                        await order_executor.open_pair(
-                            sym_a=sym_a, side_a="buy",  qty_a=sizing["qty_a"], price_a=price_a,
-                            sym_b=sym_b, side_b="sell", qty_b=sizing["qty_b"], price_b=price_b,
-                            pair_prefix=prefix,
+
+                    # ── 4. 신호 처리 (기존 진입 조건 로직 유지) ─────────────────
+                    if signal == "ENTRY_SHORT_A_LONG_B" and trade_usdt > 0:
+                        sizing = risk_manager.calc_qty(price_a, price_b, trade_usdt)
+                        logger.info(
+                            f"[{prefix}] 진입 시그널 발생 | A Short / B Long | "
+                            f"z={state['z_score']:+.3f} dev={dev:+.3f}%"
                         )
-                    except LeggingError as e:
-                        logger.error(f"[{prefix}] {e} — 포지션 미기록")
-                        await notifier.send_legging_alert(prefix, str(e))
-                        await asyncio.sleep(POLL_INTERVAL_SEC)
-                        continue
-                    risk_manager.open_position("LONG_A_SHORT_B", ratio, trade_usdt, prefix)
-                    bot_state.positions[prefix] = PairPosition(
-                        prefix=prefix, side="LONG_A_SHORT_B",
-                        entry_ratio=ratio, sym_a=sym_a, sym_b=sym_b,
-                        price_a=price_a, price_b=price_b, trade_usdt=trade_usdt,
-                        entry_time=_now_kst(),
-                        entry_z_score=state["z_score"],
-                    )
-                    await notifier.send_entry(
-                        prefix, sym_a, "buy", price_a, sym_b, "sell", price_b, trade_usdt
-                    )
-                    await save_state(bot_state)  # 진입 직후 상태 저장
+                        try:
+                            await order_executor.open_pair(
+                                sym_a=sym_a, side_a="sell", qty_a=sizing["qty_a"], price_a=price_a,
+                                sym_b=sym_b, side_b="buy",  qty_b=sizing["qty_b"], price_b=price_b,
+                                pair_prefix=prefix,
+                            )
+                        except LeggingError as e:
+                            logger.error(f"[{prefix}] {e} — 포지션 미기록")
+                            await notifier.send_legging_alert(prefix, str(e))
+                            await asyncio.sleep(POLL_INTERVAL_SEC)
+                            continue
+                        risk_manager.open_position("SHORT_A_LONG_B", ratio, trade_usdt, prefix)
+                        bot_state.positions[prefix] = PairPosition(
+                            prefix=prefix, side="SHORT_A_LONG_B",
+                            entry_ratio=ratio, sym_a=sym_a, sym_b=sym_b,
+                            price_a=price_a, price_b=price_b, trade_usdt=trade_usdt,
+                            entry_time=_now_kst(),
+                            entry_z_score=state["z_score"],
+                        )
+                        await notifier.send_entry(
+                            prefix, sym_a, "sell", price_a, sym_b, "buy", price_b, trade_usdt
+                        )
+                        await save_state(bot_state)  # 진입 직후 상태 저장
+
+                    elif signal == "ENTRY_LONG_A_SHORT_B" and trade_usdt > 0:
+                        sizing = risk_manager.calc_qty(price_a, price_b, trade_usdt)
+                        logger.info(
+                            f"[{prefix}] 진입 시그널 발생 | A Long / B Short | "
+                            f"z={state['z_score']:+.3f} dev={dev:+.3f}%"
+                        )
+                        try:
+                            await order_executor.open_pair(
+                                sym_a=sym_a, side_a="buy",  qty_a=sizing["qty_a"], price_a=price_a,
+                                sym_b=sym_b, side_b="sell", qty_b=sizing["qty_b"], price_b=price_b,
+                                pair_prefix=prefix,
+                            )
+                        except LeggingError as e:
+                            logger.error(f"[{prefix}] {e} — 포지션 미기록")
+                            await notifier.send_legging_alert(prefix, str(e))
+                            await asyncio.sleep(POLL_INTERVAL_SEC)
+                            continue
+                        risk_manager.open_position("LONG_A_SHORT_B", ratio, trade_usdt, prefix)
+                        bot_state.positions[prefix] = PairPosition(
+                            prefix=prefix, side="LONG_A_SHORT_B",
+                            entry_ratio=ratio, sym_a=sym_a, sym_b=sym_b,
+                            price_a=price_a, price_b=price_b, trade_usdt=trade_usdt,
+                            entry_time=_now_kst(),
+                            entry_z_score=state["z_score"],
+                        )
+                        await notifier.send_entry(
+                            prefix, sym_a, "buy", price_a, sym_b, "sell", price_b, trade_usdt
+                        )
+                        await save_state(bot_state)  # 진입 직후 상태 저장
 
             else:
                 # 청산 / 손절 판단 — 공통 핸들러로 위임
@@ -560,9 +573,10 @@ async def main_loop():
     else:
         logger.warning("[텔레그램] 토큰 미설정 — 텔레그램 기능 비활성화")
 
-    # ── 5개 페어 루프 + BTC 변동성 모니터 병렬 실행 ──────────────────────────
+    # ── 10개 페어 루프 + BTC 변동성 모니터 병렬 실행 ──────────────────────────
+    entry_lock = asyncio.Lock()  # 신규 진입 동시성 제어용 Lock
     tasks = [
-        pair_loop(sym_a, sym_b, exchange, order_executor, bot_state, notifier)
+        pair_loop(sym_a, sym_b, exchange, order_executor, bot_state, notifier, entry_lock)
         for sym_a, sym_b in PAIRS_TO_TRADE
     ]
     tasks.append(btc_turbulence_monitor(exchange, bot_state, notifier))
