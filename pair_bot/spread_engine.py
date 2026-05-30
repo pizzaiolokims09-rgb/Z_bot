@@ -7,7 +7,12 @@
 import collections
 import math
 import logging
-from config import RATIO_WINDOW, ENTRY_THRESHOLD_PCT, EXIT_THRESHOLD_PCT, STOP_LOSS_PCT
+from config import (
+    RATIO_WINDOW,
+    ENTRY_THRESHOLD_PCT, EXIT_THRESHOLD_PCT, STOP_LOSS_PCT,
+    ENTRY_Z_SCORE, EXIT_Z_SCORE, STOP_LOSS_Z_SCORE,
+    MIN_SPREAD_THRESHOLD,
+)
 
 logger = logging.getLogger("pair_bot")
 
@@ -47,7 +52,7 @@ class SpreadEngine:
         z_score   = (ratio - mean) / std if std > 1e-12 else 0.0
         dev_pct   = ((ratio - mean) / mean) * 100.0 if mean > 1e-12 else 0.0
 
-        signal = self._classify_signal(dev_pct, ready)
+        signal = self._classify_signal(z_score, dev_pct, ready)
 
         return {
             "ratio"   : ratio,
@@ -80,33 +85,36 @@ class SpreadEngine:
         variance = sum((x - mean) ** 2 for x in data) / (n - 1)
         return mean, math.sqrt(variance)
 
-    def _classify_signal(self, dev_pct: float, ready: bool) -> str:
+    def _classify_signal(self, z_score: float, dev_pct: float, ready: bool) -> str:
         """
-        괴리율을 기반으로 매매 신호를 분류합니다.
+        하이브리드 진입 조건 (AND): Z-Score + 최소 괴리율 모두 충족해야 진입
 
-        dev_pct > 0  : ratio가 평균보다 높음 → A 고평가, B 저평가
-        dev_pct < 0  : ratio가 평균보다 낮음 → A 저평가, B 고평가
+        z_score > 0 : ratio가 평균보다 높음 → A 고평가, B 저평가
+        z_score < 0 : ratio가 평균보다 낮음 → A 저평가, B 고평가
+
+        진입 조건 (AND):
+          조건 A: |Z-Score| >= ENTRY_Z_SCORE (2.0)
+          조건 B: |dev_pct| >= MIN_SPREAD_THRESHOLD (0.5%)
         """
         if not ready:
             return "NONE"
 
+        abs_z   = abs(z_score)
         abs_dev = abs(dev_pct)
 
         # 1순위: 손절 (가장 먼저 체크)
-        if abs_dev >= STOP_LOSS_PCT:
+        if abs_z >= STOP_LOSS_Z_SCORE:
             return "STOP"
 
-        # 2순위: 청산 회귀
-        if abs_dev <= EXIT_THRESHOLD_PCT:
+        # 2순위: 청산 회귀 (Z-Score가 0 부근으로 돌아옴)
+        if abs_z <= EXIT_Z_SCORE:
             return "EXIT"
 
-        # 3순위: 진입
-        if abs_dev >= ENTRY_THRESHOLD_PCT:
-            if dev_pct > 0:
-                # A가 고평가: A Short, B Long
+        # 3순위: 진입 — Z-Score AND 최소 괴리율 동시 충족 (하이브리드)
+        if abs_z >= ENTRY_Z_SCORE and abs_dev >= MIN_SPREAD_THRESHOLD:
+            if z_score > 0:
                 return "ENTRY_SHORT_A_LONG_B"
             else:
-                # B가 고평가: B Short, A Long
                 return "ENTRY_LONG_A_SHORT_B"
 
         return "NONE"

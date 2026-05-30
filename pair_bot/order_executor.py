@@ -17,6 +17,11 @@ from config import (
 logger = logging.getLogger("pair_bot")
 
 
+class LeggingError(Exception):
+    """짝짝이 체결(한쪽만 성공) 시 롤백 후 발생시키는 예외."""
+    pass
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 페이퍼 트레이딩 가상 계좌
 # ─────────────────────────────────────────────────────────────────────────────
@@ -68,35 +73,65 @@ class OrderExecutor:
     # ── 교환소 초기화 ─────────────────────────────────────────────────────────
 
     def _init_exchange(self):
-        """ccxt binanceusdm 교환소를 초기화하고 모든 페어의 레버리지를 설정합니다."""
+        """
+        ccxt.binance 통합 클래스로 선물 교환소를 초기화합니다.
+        USE_TESTNET=True 이면 enable_demo_trading(True)으로
+        demo.binance.com API 서버에 접속합니다.
+        """
         try:
             import ccxt
-            self._exchange = ccxt.binanceusdm({
+
+            self._exchange = ccxt.binance({
                 "apiKey"         : API_KEY,
                 "secret"         : API_SECRET,
                 "options"        : {"defaultType": "future"},
                 "enableRateLimit": True,
             })
-            
-            if USE_TESTNET:
-                # 최신 CCXT에서 binanceusdm 샌드박스 모드가 deprecated 되어 수동으로 API URL 변경
-                self._exchange.urls['api']['fapiPublic'] = 'https://testnet.binancefuture.com/fapi/v1'
-                self._exchange.urls['api']['fapiPrivate'] = 'https://testnet.binancefuture.com/fapi/v1'
-                self._exchange.urls['api']['fapiV2'] = 'https://testnet.binancefuture.com/fapi/v2'
-                logger.info("[실거래] 바이낸스 모의투자(Testnet) 모드 활성화 (수동 URL 패치)")
-            else:
-                logger.info("[실거래] 바이낸스 실거래(Mainnet) 모드 활성화")
 
-            for sym_a, sym_b in PAIRS_TO_TRADE:
-                for sym in (sym_a + ":USDT", sym_b + ":USDT"):
-                    try:
-                        self._exchange.set_leverage(LEVERAGE, sym)
-                    except Exception as e:
-                        logger.warning(f"[레버리지 설정 실패] {sym}: {e}")
-            logger.info(f"[실거래] 바이낸스 선물 연결 완료. 레버리지={LEVERAGE}x")
+            if USE_TESTNET:
+                # CCXT 4.x 공식 메서드 — demo.binance.com 전용 URL 자동 적용
+                self._exchange.enable_demo_trading(True)
+                logger.info("[거래소] 데모 트레이딩 모드 활성화 (demo.binance.com)")
+            else:
+                logger.info("[거래소] Mainnet 실거래 모드 활성화")
+
+            logger.info(
+                f"[거래소] 바이낸스 선물({'Demo' if USE_TESTNET else 'Mainnet'}) "
+                f"연결 초기화 완료"
+            )
         except Exception as e:
-            logger.error(f"[실거래] 교환소 초기화 실패: {e}")
+            logger.error(f"[거래소] 초기화 실패: {e}")
             raise
+
+
+
+    async def setup_leverage(self) -> None:
+        """
+        봇 시작 시 1회 호출. PAIRS_TO_TRADE 전 심볼의 레버리지를 LEVERAGE 값으로 세팅합니다.
+        IS_PAPER_TRADING 모드에서는 건너뜁니다.
+        """
+        if IS_PAPER_TRADING:
+            logger.info(f"[PAPER] 레버리지 자동 세팅 스킵 (가상 계좌)")
+            return
+
+        success, fail = 0, 0
+        for sym_a, sym_b in PAIRS_TO_TRADE:
+            for raw_sym in (sym_a, sym_b):
+                # BTC/USDT → BTC/USDT:USDT (바이낸스 선물 표기)
+                sym = raw_sym if ":" in raw_sym else raw_sym.replace("/USDT", "/USDT:USDT")
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        lambda s=sym: self._exchange.set_leverage(LEVERAGE, s)
+                    )
+                    logger.info(f"[레버리지] {sym} → {LEVERAGE}x 세팅 완료")
+                    success += 1
+                except Exception as e:
+                    logger.warning(f"[레버리지 설정 실패] {sym}: {e}")
+                    fail += 1
+        logger.info(
+            f"[레버리지] 전체 세팅 완료 | 성공={success}개 / 실패={fail}개 | {LEVERAGE}x 적용"
+        )
 
     # ── 잔고 조회 ─────────────────────────────────────────────────────────────
 
@@ -110,12 +145,28 @@ class OrderExecutor:
             return self._paper.free_balance
 
         try:
-            bal = await asyncio.get_event_loop().run_in_executor(
+            bal = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: self._exchange.fetch_balance()
             )
             return float(bal.get("free", {}).get("USDT", 0.0))
         except Exception as e:
             logger.warning(f"[잔고조회 실패] {e} — 0 반환")
+            return 0.0
+
+    async def get_total_balance(self) -> float:
+        """
+        초기 자본 대비 손실률(킬 스위치) 계산용 총 USDT 잔고 (사용 중인 증거금 포함)
+        """
+        if IS_PAPER_TRADING:
+            return self._paper.free_balance
+
+        try:
+            bal = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._exchange.fetch_balance()
+            )
+            return float(bal.get("total", {}).get("USDT", 0.0))
+        except Exception as e:
+            logger.warning(f"[총잔고조회 실패] {e} — 0 반환")
             return 0.0
 
     # ── 공개 API ──────────────────────────────────────────────────────────────
@@ -126,15 +177,48 @@ class OrderExecutor:
         sym_b: str, side_b: str, qty_b: float, price_b: float,
         pair_prefix: str = "",
     ):
-        """두 레그를 동시에(asyncio.gather) 진입 주문합니다."""
+        """
+        두 레그를 동시에 진입 주문합니다.
+        한쪽만 성공(짝짝이 체결) 시 성공한 레그를 즉시 롤백하고 LeggingError를 raise합니다.
+        """
         logger.info(
             f"[{pair_prefix}] [주문진입] A={sym_a} {side_a} {qty_a:.4f} @ ~{price_a:.4f} | "
             f"B={sym_b} {side_b} {qty_b:.4f} @ ~{price_b:.4f}"
         )
-        await asyncio.gather(
+
+        results = await asyncio.gather(
             self._place_order(sym_a, side_a, qty_a, price_a, pair_prefix),
             self._place_order(sym_b, side_b, qty_b, price_b, pair_prefix),
+            return_exceptions=True,
         )
+
+        a_ok = not isinstance(results[0], Exception)
+        b_ok = not isinstance(results[1], Exception)
+
+        if a_ok and b_ok:
+            return  # 양쪽 모두 성공
+
+        if a_ok and not b_ok:
+            # A만 성공, B 실패 → A 롤백
+            logger.error(
+                f"[{pair_prefix}] [Legging Risk] B 주문 실패! A 포지션 즉시 롤백 | "
+                f"B 에러: {results[1]}"
+            )
+            await self._rollback_leg(sym_a, side_a, qty_a, price_a, pair_prefix)
+            raise LeggingError(f"[{pair_prefix}] B 주문 실패 → A 롤백 완료")
+
+        if not a_ok and b_ok:
+            # B만 성공, A 실패 → B 롤백
+            logger.error(
+                f"[{pair_prefix}] [Legging Risk] A 주문 실패! B 포지션 즉시 롤백 | "
+                f"A 에러: {results[0]}"
+            )
+            await self._rollback_leg(sym_b, side_b, qty_b, price_b, pair_prefix)
+            raise LeggingError(f"[{pair_prefix}] A 주문 실패 → B 롤백 완료")
+
+        # 양쪽 모두 실패
+        logger.error(f"[{pair_prefix}] [주문실패] 양쪽 모두 실패 | A: {results[0]} | B: {results[1]}")
+        raise LeggingError(f"[{pair_prefix}] 양쪽 주문 모두 실패")
 
     async def close_pair(
         self,
@@ -170,7 +254,7 @@ class OrderExecutor:
                 if IS_PAPER_TRADING:
                     self._paper.open_order(symbol, side, qty, price, pair_prefix)
                     return
-                order = await asyncio.get_event_loop().run_in_executor(
+                order = await asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda: self._exchange.create_order(symbol, "market", side, qty)
                 )
@@ -184,19 +268,54 @@ class OrderExecutor:
                     logger.error(f"[{pair_prefix}] [주문포기] {symbol} — 재시도 횟수 초과")
                     raise
 
+    async def _rollback_leg(
+        self, symbol: str, side: str, qty: float, price: float, pair_prefix: str = ""
+    ):
+        """짝짝이 체결 시 성공했던 레그를 반대 방향 시장가로 즉시 되돌립니다."""
+        reverse_side = "sell" if side == "buy" else "buy"
+        logger.warning(
+            f"[{pair_prefix}] [롤백] {symbol} {reverse_side} {qty:.4f} 시장가 되돌리기"
+        )
+        if IS_PAPER_TRADING:
+            self._paper.close_order(symbol, price, pair_prefix)
+            return
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: self._exchange.create_order(
+                    symbol, "market", reverse_side, qty, {"reduceOnly": True}
+                ),
+            )
+            logger.info(f"[{pair_prefix}] [롤백 성공] {symbol} {reverse_side} {qty:.4f}")
+        except Exception as e:
+            logger.critical(
+                f"[{pair_prefix}] [롤백 실패!] {symbol}: {e} — 수동 확인 필요!"
+            )
+
     async def _close_real_position(self, symbol: str, pair_prefix: str = ""):
         """실거래 포지션 전량 청산 (reduceOnly)."""
         for attempt in range(1, ORDER_RETRY_COUNT + 1):
             try:
-                pos = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: self._exchange.fetch_position(symbol)
+                positions = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: self._exchange.fetch_positions([symbol])
                 )
+                pos = positions[0] if positions else {}
                 contracts = abs(float(pos.get("contracts", 0)))
                 if contracts == 0:
                     logger.info(f"[{pair_prefix}] [청산] {symbol} 보유 포지션 없음, 스킵")
                     return
-                close_side = "sell" if float(pos.get("contracts", 0)) > 0 else "buy"
-                order = await asyncio.get_event_loop().run_in_executor(
+                
+                # CCXT의 contracts는 절대값이므로, side 필드로 방향 판단
+                pos_side = pos.get("side")
+                if pos_side == "short":
+                    close_side = "buy"
+                elif pos_side == "long":
+                    close_side = "sell"
+                else:
+                    amt = float(pos.get("info", {}).get("positionAmt", 0))
+                    close_side = "sell" if amt > 0 else "buy"
+                    
+                order = await asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda: self._exchange.create_order(
                         symbol, "market", close_side, contracts, {"reduceOnly": True}

@@ -66,7 +66,8 @@ class RiskManager:
 
     def close_position(self, pair_prefix: str = ""):
         """청산/손절 후 포지션 상태를 초기화합니다."""
-        logger.info(f"[{pair_prefix}] [포지션 닫힘] side={self.position_side}, entry_ratio={self.entry_ratio:.6f}")
+        ratio_str = f"{self.entry_ratio:.6f}" if self.entry_ratio is not None else "N/A"
+        logger.info(f"[{pair_prefix}] [포지션 닫힘] side={self.position_side}, entry_ratio={ratio_str}")
         self.position_side  = None
         self.entry_ratio    = None
         self.entry_notional = 0.0
