@@ -457,8 +457,8 @@ async def pair_loop(
                         )
                         await save_state(bot_state)  # 진입 직후 상태 저장
 
-            else:
-                # 청산 / 손절 판단 — 공통 핸들러로 위임
+            elif risk_manager.has_position:
+                # 청산 / 손절 판단 — 공통 핸들러로 위임 (포지션 보유 시에만 진입)
                 if signal == "STOP" or risk_manager.should_stop_loss(dev):
                     await _execute_close(
                         prefix, "STOP_LOSS", price_a, price_b,
