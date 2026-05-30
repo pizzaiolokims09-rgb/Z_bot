@@ -34,7 +34,7 @@ USE_TESTNET = os.getenv("USE_TESTNET", "true").lower() == "true"
 PAIRS_TO_TRADE = [
     ("BTC/USDT",      "ETH/USDT"),
     ("SOL/USDT",      "AVAX/USDT"),
-    ("XRP/USDT",      "ADA/USDT"),
+    ("XRP/USDT",      "XLM/USDT"),
     ("DOGE/USDT",     "1000SHIB/USDT"),
     ("LINK/USDT",     "DOT/USDT"),
 ]
