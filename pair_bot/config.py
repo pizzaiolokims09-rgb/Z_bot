@@ -33,18 +33,27 @@ USE_TESTNET = os.getenv("USE_TESTNET", "true").lower() == "true"
 # 바이낸스 선물 표기법: spot 심볼로 입력하면 내부에서 :USDT 변환
 PAIRS_TO_TRADE = [
     ("BTC/USDT",      "ETH/USDT"),
-    ("SOL/USDT",      "AVAX/USDT"),
     ("XRP/USDT",      "XLM/USDT"),
+    ("SOL/USDT",      "AVAX/USDT"),
     ("DOGE/USDT",     "1000SHIB/USDT"),
     ("LINK/USDT",     "DOT/USDT"),
+    ("ARB/USDT",      "OP/USDT"),
+    ("LTC/USDT",      "BCH/USDT"),
+    ("ADA/USDT",      "TRX/USDT"),
+    ("UNI/USDT",      "AAVE/USDT"),
+    ("SAND/USDT",     "MANA/USDT"),
 ]
 
 # ── 레버리지 ────────────────────────────────────────────────────────────────
 LEVERAGE = 5   # 바이낸스 선물 레버리지 배수 (봇 시작 시 API로 자동 세팅)
 
+# ── 최대 동시 진입 슬롯 ─────────────────────────────────────────────────────
+# 10개 페어를 감시하되, 동시에 포지션을 보유할 수 있는 최대 페어 수
+MAX_ACTIVE_PAIRS = int(os.getenv("MAX_ACTIVE_PAIRS", "5"))
+
 # ── 동적 비중 설정 ──────────────────────────────────────────────────────────
 # 진입 시 계좌 가용 잔고(Free USDT)의 이 비율만큼 한 페어에 배분
-# 14% x 5개 페어 = 70% 사용 → 30% 여유 증거금 상시 유지
+# 14% x MAX_ACTIVE_PAIRS(5)개 = 70% 사용 → 30% 여유 증거금 상시 유지
 # 예: 0.14 → 잔고 1000 USDT → 해당 페어 총 140 USDT (롱 70 / 숏 70)
 ALLOCATION_PER_PAIR = 0.14
 

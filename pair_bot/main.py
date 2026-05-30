@@ -15,7 +15,7 @@ import ccxt.async_support as ccxt_async
 
 from config import (
     IS_PAPER_TRADING, PAIRS_TO_TRADE,
-    ALLOCATION_PER_PAIR, LEVERAGE,
+    ALLOCATION_PER_PAIR, LEVERAGE, MAX_ACTIVE_PAIRS,
     POLL_INTERVAL_SEC, LOG_FILE,
     TELEGRAM_BOT_TOKEN, MAX_DRAWDOWN_LIMIT,
     API_KEY, API_SECRET, USE_TESTNET,
@@ -364,6 +364,15 @@ async def pair_loop(
                     await asyncio.sleep(POLL_INTERVAL_SEC)
                     continue
 
+                # 슬롯 제한: 동시 포지션 수가 MAX_ACTIVE_PAIRS 이상이면 신규 진입 스킵
+                active_count = len(bot_state.positions)
+                if active_count >= MAX_ACTIVE_PAIRS:
+                    logger.debug(
+                        f"[{prefix}] 슬롯 꼽 차서 진입 스킵 (활성={active_count}/{MAX_ACTIVE_PAIRS})"
+                    )
+                    await asyncio.sleep(POLL_INTERVAL_SEC)
+                    continue
+
                 free_bal   = await order_executor.get_free_balance()
                 # 페어 총 배분 = 잔고 x 14%, 각 레그(롱/숏) = 그 절반 (7%)
                 trade_usdt = (free_bal * ALLOCATION_PER_PAIR) / 2.0
@@ -495,7 +504,7 @@ async def main_loop():
     mode_str = "PAPER TRADING (가상 시뮬레이션)" if IS_PAPER_TRADING else "LIVE TRADING (실계좌)"
     logger.info("=" * 60)
     logger.info(f"  페어 트레이딩 봇 시작 — 모드: {mode_str}")
-    logger.info(f"  감시 페어 수: {len(PAIRS_TO_TRADE)}개")
+    logger.info(f"  감시 페어 수: {len(PAIRS_TO_TRADE)}개 | 최대 동시 진입: {MAX_ACTIVE_PAIRS}개")
     for sym_a, sym_b in PAIRS_TO_TRADE:
         logger.info(f"    [{make_prefix(sym_a, sym_b):12s}]  {sym_a}  /  {sym_b}")
     logger.info(f"  페어당 배분 비율: {ALLOCATION_PER_PAIR * 100:.0f}%")
