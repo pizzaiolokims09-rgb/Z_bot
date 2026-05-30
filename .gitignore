@@ -31,3 +31,4 @@ Thumbs.db
 # Bot Data & State
 *.csv
 bot_state.json
+z_bot 서버명령어.txt
