@@ -606,7 +606,9 @@ async def pair_loop(
                     if hold_sec >= MAX_HOLD_SECONDS:
                         pos = bot_state.positions.get(prefix)
                         if pos:
-                            net_pnl, _ = bot_state.calc_pnl(pos, price_a, price_b, LEVERAGE)
+                            res_a = {"average": price_a, "qty": (pos.margin_a * LEVERAGE)/pos.price_a, "maker": False}
+                            res_b = {"average": price_b, "qty": (pos.margin_b * LEVERAGE)/pos.price_b, "maker": False}
+                            net_pnl, _ = bot_state.calc_pnl(pos, res_a, res_b)
                             if net_pnl <= 0:
                                 logger.warning(
                                     f"[{prefix}] 보유 시간 초과 ({hold_sec:.0f}초) + "
@@ -654,9 +656,9 @@ async def pair_loop(
                     # 익절 안전장치: Maker 수수료 기준 Net PnL 0 초과 시에만 청산
                     pos = bot_state.positions.get(prefix)
                     if pos:
-                        net_pnl, _ = bot_state.calc_pnl(
-                            pos, price_a, price_b, LEVERAGE, is_maker_exit=True
-                        )
+                        res_a = {"average": price_a, "qty": (pos.margin_a * LEVERAGE)/pos.price_a, "maker": True}
+                        res_b = {"average": price_b, "qty": (pos.margin_b * LEVERAGE)/pos.price_b, "maker": True}
+                        net_pnl, _ = bot_state.calc_pnl(pos, res_a, res_b)
                         if net_pnl <= 0:
                             logger.debug(
                                 f"[{prefix}] EXIT 시그널 무시 — "
