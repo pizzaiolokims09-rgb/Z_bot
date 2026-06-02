@@ -25,6 +25,7 @@ from config import (
     STOP_LOSS_COOLDOWN_SEC,
     MAX_STOP_LOSS_PER_PAIR, MAX_HOLD_SECONDS,
     WARMUP_BATCH_SIZE, EXIT_Z_SCORE,
+    ENTRY_CONFIRMATION_SEC,
 )
 from spread_engine      import SpreadEngine
 from risk_manager       import RiskManager
@@ -370,6 +371,7 @@ async def pair_loop(
     risk_manager  = RiskManager()    # 이 페어 전용 포지션 상태
 
     entry_timestamp = 0.0      # 포지션 진입 시각 (time.time() 기반, 시간 기반 청산용)
+    entry_confirm_ts = 0.0     # 30초 확인 매매: Z-Score가 문턴을 처음 넘은 시각
     reconnect_wait = 5
 
     # ── 봇 상태(bot_state)에서 기존 포지션 복구 ──
@@ -453,16 +455,53 @@ async def pair_loop(
 
             # ── 3. 동적 포지션 사이징 — 가용 잔고의 14% (핵심 자금 관리 유지) ─
             total_margin = 0.0
+
+            # Z-Score가 문턱 아래로 내려가면 30초 확인 타이머 리셋
+            if not signal.startswith("ENTRY") and entry_confirm_ts > 0.0:
+                logger.debug(f"[{prefix}] Z-Score 문턱 이탈 → 30초 확인 타이머 리셋")
+                entry_confirm_ts = 0.0
+
             if not risk_manager.has_position and signal.startswith("ENTRY"):
                 # 봇 정지 상태면 진입 스킵 (기존 포지션 관리는 계속)
                 if not bot_state.is_accepting_entries:
+                    entry_confirm_ts = 0.0  # 타이머 초기화
                     await asyncio.sleep(POLL_INTERVAL_SEC)
                     continue
 
                 # BTC 시장 폭주 감지 시 신규 진입 차단 (청산 감시는 통과)
                 if bot_state.market_turbulent:
+                    entry_confirm_ts = 0.0  # 타이머 초기화
                     await asyncio.sleep(POLL_INTERVAL_SEC)
                     continue
+
+                # ── 30초 확인 매매 필터 (Whipsaw Prevention) ──────────────────
+                now_ts = time.time()
+                if entry_confirm_ts == 0.0:
+                    # Z-Score가 진입 문턴을 처음 넘은 시점 → 타이머 시작
+                    entry_confirm_ts = now_ts
+                    logger.info(
+                        f"[{prefix}] 30초 확인 필터 시작 | z={state['z_score']:+.3f} | "
+                        f"신호={signal}"
+                    )
+                    await asyncio.sleep(POLL_INTERVAL_SEC)
+                    continue
+
+                elapsed_confirm = now_ts - entry_confirm_ts
+                if elapsed_confirm < ENTRY_CONFIRMATION_SEC:
+                    remaining = ENTRY_CONFIRMATION_SEC - elapsed_confirm
+                    logger.debug(
+                        f"[{prefix}] 확인 대기 중 | {elapsed_confirm:.0f}/{ENTRY_CONFIRMATION_SEC}초 | "
+                        f"남은={remaining:.0f}초"
+                    )
+                    await asyncio.sleep(POLL_INTERVAL_SEC)
+                    continue
+
+                # 30초 경과 → 진짜 타점으로 인정! 타이머 초기화 후 진입 진행
+                logger.info(
+                    f"[{prefix}] 30초 확인 필터 통과! | z={state['z_score']:+.3f} | "
+                    f"신호={signal} | 진입 실행"
+                )
+                entry_confirm_ts = 0.0
 
                 # 손절 후 재진입 쿨다운 (진입→손절 무한루프 방지)
                 elapsed = time.time() - bot_state.cooldowns.get(prefix, 0.0)

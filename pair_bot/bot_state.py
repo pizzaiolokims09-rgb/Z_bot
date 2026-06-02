@@ -102,16 +102,20 @@ class BotState:
     ) -> Tuple[float, float]:
         """
         수수료가 완전히 차감된 순수익(Net PnL)을 반환합니다.
-        result_a, result_b는 거래소에서 반환한 체결 딕셔너리 (average, fee, qty, maker, info 등 포함)
+
+        result_a, result_b 딕셔너리 필드:
+          - total_realized_pnl: fetch_my_trades에서 합산한 거래소 정산 실현손익 (부분체결 완전합산)
+          - total_fee: fetch_my_trades에서 합산한 거래소 실제 수수료
+          - average, qty, maker: 가중평균가, 수량, Maker 여부
+          위 필드가 None이면 실시간 감시(가상 청산) 모드 → 수학 수식 Fallback
         
         반환: (net_pnl_usdt, net_pnl_pct)
         """
-        info_a = result_a.get("info", {})
-        info_b = result_b.get("info", {})
-
-        # Binance API 원본에서 realizedPnl 추출 시도
-        realized_a = info_a.get("realizedPnl")
-        realized_b = info_b.get("realizedPnl")
+        # 거래소 정산 값 추출 (fetch_my_trades 합산 결과)
+        rpnl_a = result_a.get("total_realized_pnl")
+        rpnl_b = result_b.get("total_realized_pnl")
+        tfee_a = result_a.get("total_fee")
+        tfee_b = result_b.get("total_fee")
 
         avg_a = result_a.get("average", 0.0)
         avg_b = result_b.get("average", 0.0)
@@ -124,15 +128,18 @@ class BotState:
         qty_b = result_b.get("qty", 0.0)
         
         # 방어 로직: 수량이 0이면 기존 계산식으로 대체
-        leverage = 5  # config.LEVERAGE이지만 기본값 5로 폴백하거나 추산 (호출처에서 넘기지 않으므로 고정 또는 pos에서 역산 가능)
+        leverage = 5
         if qty_a == 0.0: qty_a = pos.margin_a * leverage / pos.price_a
         if qty_b == 0.0: qty_b = pos.margin_b * leverage / pos.price_b
 
-        # 1) Gross PnL 산출 (API 원본 값 우선, 없으면 수학 수식 Fallback)
-        if realized_a is not None and realized_b is not None:
-            gross = float(realized_a) + float(realized_b)
+        # 1) Gross PnL 산출
+        has_exchange_pnl = (rpnl_a is not None and rpnl_b is not None)
+
+        if has_exchange_pnl:
+            # 거래소 정산 값 직접 사용 (부분체결 완벽 합산, 수학 수식 없음)
+            gross = float(rpnl_a) + float(rpnl_b)
         else:
-            # 실시간 감시 등 가상 청산 시 Fallback (수식 계산)
+            # 실시간 감시(가상 청산) Fallback — 수학 수식 추산
             if pos.side == "LONG_A_SHORT_B":
                 gross = qty_a * (avg_a - pos.price_a) + qty_b * (pos.price_b - avg_b)
             else:  # SHORT_A_LONG_B
@@ -141,19 +148,22 @@ class BotState:
         # 2) 수수료 계산
         total_notional = (qty_a * pos.price_a) + (qty_b * pos.price_b)
         entry_fee = total_notional * TAKER_FEE_RATE       # 진입 2회 (시장가)
-        
-        # 청산 수수료는 API 리턴값(fee) 우선 사용, 없으면 설정된 TAKER/MAKER rate로 추산
-        fee_a = result_a.get("fee", 0.0)
-        if fee_a == 0.0:
-            rate_a = MAKER_FEE_RATE if result_a.get("maker") else TAKER_FEE_RATE
-            fee_a = (qty_a * avg_a) * rate_a
-            
-        fee_b = result_b.get("fee", 0.0)
-        if fee_b == 0.0:
-            rate_b = MAKER_FEE_RATE if result_b.get("maker") else TAKER_FEE_RATE
-            fee_b = (qty_b * avg_b) * rate_b
-            
-        exit_fee = fee_a + fee_b
+
+        if has_exchange_pnl and tfee_a is not None and tfee_b is not None:
+            # 거래소 실제 수수료 (fetch_my_trades 합산)
+            exit_fee = float(tfee_a) + float(tfee_b)
+        else:
+            # Fallback: 수수료율로 추산
+            fee_a = result_a.get("fee", 0.0)
+            if fee_a == 0.0:
+                rate_a = MAKER_FEE_RATE if result_a.get("maker") else TAKER_FEE_RATE
+                fee_a = (qty_a * avg_a) * rate_a
+            fee_b = result_b.get("fee", 0.0)
+            if fee_b == 0.0:
+                rate_b = MAKER_FEE_RATE if result_b.get("maker") else TAKER_FEE_RATE
+                fee_b = (qty_b * avg_b) * rate_b
+            exit_fee = fee_a + fee_b
+
         total_fee = entry_fee + exit_fee
 
         # 3) 최종 Net PnL 산출

@@ -395,11 +395,9 @@ class OrderExecutor:
                             f"[{pair_prefix}] [지정가 체결] {symbol} 완료! "
                             f"(Maker 수수료 적용, {elapsed}초 소요)"
                         )
-                        avg_price = fetched.get("average") or fetched.get("price") or limit_price
-                        fee_cost = 0.0
-                        if fetched.get("fee"):
-                            fee_cost = fetched["fee"].get("cost", 0.0)
-                        return {"symbol": symbol, "average": avg_price, "fee": fee_cost, "qty": contracts, "side": close_side, "maker": True, "info": fetched.get("info", {})}
+                        return await self._aggregate_trades_for_order(
+                            symbol, order_id, contracts, close_side, is_maker=True, pair_prefix=pair_prefix
+                        )
                     elif status == "canceled":
                         logger.warning(
                             f"[{pair_prefix}] [지정가] {symbol} 외부 취소됨 → 시장가 Fallback"
@@ -482,6 +480,61 @@ class OrderExecutor:
                 f"[{pair_prefix}] [롤백 실패!] {symbol}: {e} — 수동 확인 필요!"
             )
 
+    async def _aggregate_trades_for_order(
+        self, symbol: str, order_id: str, qty: float, side: str,
+        is_maker: bool = False, pair_prefix: str = ""
+    ) -> dict:
+        """
+        fetch_my_trades를 호출해 해당 order_id의 모든 부분 체결(Trade)을 합산합니다.
+        부분 체결이 여러 건이어도 realizedPnl과 fee를 누락 없이 누적합니다.
+        """
+        try:
+            await asyncio.sleep(0.5)  # 거래소 정산 지연 대기
+            trades = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._exchange.fetch_my_trades(symbol, limit=50)
+            )
+            matched = [t for t in trades if t.get("order") == order_id]
+
+            if not matched:
+                logger.warning(f"[{pair_prefix}] fetch_my_trades에서 order_id={order_id} 매칭 없음 — 기본값 사용")
+                return {"symbol": symbol, "average": 0.0, "fee": 0.0, "qty": qty, "side": side, "maker": is_maker, "total_realized_pnl": None, "total_fee": None}
+
+            total_realized_pnl = 0.0
+            total_fee = 0.0
+            total_cost = 0.0  # price * amount 합산 (가중평균가 계산용)
+            total_amount = 0.0
+
+            for t in matched:
+                info = t.get("info", {})
+                rpnl = info.get("realizedPnl")
+                if rpnl is not None:
+                    total_realized_pnl += float(rpnl)
+                commission = info.get("commission")
+                if commission is not None:
+                    total_fee += float(commission)
+                elif t.get("fee") and t["fee"].get("cost"):
+                    total_fee += float(t["fee"]["cost"])
+                amt = float(t.get("amount", 0))
+                prc = float(t.get("price", 0))
+                total_amount += amt
+                total_cost += amt * prc
+
+            avg_price = (total_cost / total_amount) if total_amount > 0 else 0.0
+
+            logger.info(
+                f"[{pair_prefix}] [체결합산] {symbol} | 체결건수={len(matched)} | "
+                f"realizedPnl={total_realized_pnl:+.4f} | fee={total_fee:.4f} | avg={avg_price:.4f}"
+            )
+            return {
+                "symbol": symbol, "average": avg_price, "fee": total_fee,
+                "qty": total_amount if total_amount > 0 else qty,
+                "side": side, "maker": is_maker,
+                "total_realized_pnl": total_realized_pnl, "total_fee": total_fee,
+            }
+        except Exception as e:
+            logger.warning(f"[{pair_prefix}] fetch_my_trades 실패: {e} — 기본값 사용")
+            return {"symbol": symbol, "average": 0.0, "fee": 0.0, "qty": qty, "side": side, "maker": is_maker, "total_realized_pnl": None, "total_fee": None}
+
     async def _close_real_position(self, symbol: str, pair_prefix: str = ""):
         """실거래 포지션 전량 시장가 청산 (reduceOnly)."""
         for attempt in range(1, ORDER_RETRY_COUNT + 1):
@@ -511,21 +564,13 @@ class OrderExecutor:
                         symbol, "market", close_side, contracts, {"reduceOnly": True}
                     )
                 )
-                logger.info(f"[{pair_prefix}] [실거래] 청산완료 id={order['id']} | {symbol}")
+                order_id = order['id']
+                logger.info(f"[{pair_prefix}] [실거래] 청산완료 id={order_id} | {symbol}")
                 
-                # 정확한 실체결가(average)와 수수료(fee)를 가져오기 위해 fetch_order 호출
-                try:
-                    fetched = await asyncio.get_running_loop().run_in_executor(
-                        None, lambda: self._exchange.fetch_order(order['id'], symbol)
-                    )
-                    avg_price = fetched.get("average") or fetched.get("price") or 0.0
-                    fee_cost = 0.0
-                    if fetched.get("fee"):
-                        fee_cost = fetched["fee"].get("cost", 0.0)
-                    return {"symbol": symbol, "average": avg_price, "fee": fee_cost, "qty": contracts, "side": close_side, "maker": False, "info": fetched.get("info", {})}
-                except Exception as fe:
-                    logger.warning(f"[{pair_prefix}] 청산 주문 확인 실패 (기본값 사용): {fe}")
-                    return {"symbol": symbol, "average": 0.0, "fee": 0.0, "qty": contracts, "side": close_side, "maker": False}
+                # fetch_my_trades로 모든 부분 체결의 realizedPnl과 fee를 완벽 합산
+                return await self._aggregate_trades_for_order(
+                    symbol, order_id, contracts, close_side, is_maker=False, pair_prefix=pair_prefix
+                )
 
             except Exception as e:
                 logger.warning(f"[{pair_prefix}] [청산실패 {attempt}/{ORDER_RETRY_COUNT}] {symbol}: {e}")
