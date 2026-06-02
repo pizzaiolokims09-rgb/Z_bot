@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from telegram import (
@@ -25,7 +26,7 @@ from telegram.ext import (
 )
 from telegram.error import TelegramError
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, STOP_LOSS_COOLDOWN_SEC
 from bot_state import BotState
 
 if TYPE_CHECKING:
@@ -90,21 +91,22 @@ class TelegramNotifier:
         prefix: str,
         sym_a: str, side_a: str, price_a: float,
         sym_b: str, side_b: str, price_b: float,
-        trade_usdt: float,
+        margin_a: float, margin_b: float,
     ) -> None:
-        """진입 알림 전송."""
+        """진입 알림 전송 (변동성 가중치 비대칭 증거금 포함)."""
         # side_a == "buy" 이면 A가 Long, B가 Short
         long_sym  = sym_a if side_a == "buy" else sym_b
         short_sym = sym_b if side_a == "buy" else sym_a
         lp        = price_a if side_a == "buy" else price_b
         sp        = price_b if side_a == "buy" else price_a
 
+        total = margin_a + margin_b
         msg = (
             f"🟢 [진입] {prefix} 헷징 시작\n"
             f"Long  : {long_sym.split(':')[0]}\n"
             f"Short : {short_sym.split(':')[0]}\n"
             f"진입가: L={lp:.4f}  S={sp:.4f} USDT\n"
-            f"레그당 증거금: {trade_usdt:.2f} USDT"
+            f"증거금: A={margin_a:.1f} / B={margin_b:.1f} (합계={total:.1f} USDT)"
         )
         await self._send(msg)
 
@@ -238,10 +240,24 @@ class TelegramNotifier:
                 side = "L-A/S-B" if pos.side == "LONG_A_SHORT_B" else "S-A/L-B"
                 lines.append(f"  • [{prefix}] {side} | dev={dev:+.3f}%")
             pos_text = "\n".join(lines) if lines else "  없음"
+            
+            # 쿨다운 블랙리스트 계산
+            cd_lines = []
+            now = time.time()
+            for p, sl_time in self._state.cooldowns.items():
+                elapsed = now - sl_time
+                if elapsed < STOP_LOSS_COOLDOWN_SEC:
+                    rem = int(STOP_LOSS_COOLDOWN_SEC - elapsed)
+                    h, m = rem // 3600, (rem % 3600) // 60
+                    time_str = f"{h}시간 {m}분" if h > 0 else f"{m}분 {rem % 60}초"
+                    cd_lines.append(f"  • [{p}] 🚫 {time_str} 남음")
+            cd_text = "\n".join(cd_lines) if cd_lines else "  없음"
+
             await update.message.reply_text(
                 f"📊 봇 상태: {status_str}\n"
                 f"가용 잔고: {bal_str}\n\n"
-                f"활성 포지션 ({len(self._state.positions)}개):\n{pos_text}",
+                f"활성 포지션 ({len(self._state.positions)}개):\n{pos_text}\n\n"
+                f"블랙리스트 (쿨다운 중):\n{cd_text}",
                 reply_markup=self._reply_keyboard(),
             )
 
@@ -372,11 +388,25 @@ class TelegramNotifier:
             lines.append(f"  • [{prefix}] {side} | dev={dev:+.3f}%")
 
         pos_text = "\n".join(lines) if lines else "  없음"
+
+        # 쿨다운 블랙리스트 계산
+        cd_lines = []
+        now = time.time()
+        for p, sl_time in self._state.cooldowns.items():
+            elapsed = now - sl_time
+            if elapsed < STOP_LOSS_COOLDOWN_SEC:
+                rem = int(STOP_LOSS_COOLDOWN_SEC - elapsed)
+                h, m = rem // 3600, (rem % 3600) // 60
+                time_str = f"{h}시간 {m}분" if h > 0 else f"{m}분 {rem % 60}초"
+                cd_lines.append(f"  • [{p}] 🚫 {time_str} 남음")
+        cd_text = "\n".join(cd_lines) if cd_lines else "  없음"
+
         msg = (
             f"📊 봇 상태\n"
             f"상태: {state_str}\n"
             f"가용 잔고: {bal_str}\n\n"
-            f"활성 포지션 ({len(self._state.positions)}개):\n{pos_text}"
+            f"활성 포지션 ({len(self._state.positions)}개):\n{pos_text}\n\n"
+            f"블랙리스트 (쿨다운 중):\n{cd_text}"
         )
         await query.edit_message_text(msg)
 

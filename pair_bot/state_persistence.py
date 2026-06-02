@@ -45,7 +45,8 @@ async def save_state(bot_state: BotState) -> None:
             "sym_b"        : pos.sym_b,
             "price_a"      : pos.price_a,
             "price_b"      : pos.price_b,
-            "trade_usdt"   : pos.trade_usdt,
+            "margin_a"     : pos.margin_a,
+            "margin_b"     : pos.margin_b,
             "entry_time"   : _dt_to_str(pos.entry_time),
             "entry_z_score": pos.entry_z_score,
         }
@@ -56,6 +57,9 @@ async def save_state(bot_state: BotState) -> None:
         "wins"          : bot_state.wins,
         "cumulative_pnl": bot_state.cumulative_pnl,
         "initial_balance": bot_state.initial_balance,
+        "cooldowns"     : bot_state.cooldowns,
+        "daily_stop_counts": bot_state.daily_stop_counts,
+        "daily_reset_date": bot_state.daily_reset_date,
         "saved_at"      : _dt_to_str(datetime.now(KST)),
     }
 
@@ -89,10 +93,23 @@ async def load_state(bot_state: BotState) -> bool:
         bot_state.wins           = data.get("wins", 0)
         bot_state.cumulative_pnl = data.get("cumulative_pnl", 0.0)
         bot_state.initial_balance = data.get("initial_balance", 0.0)
+        
+        # 쿨다운 및 손절 횟수 복구
+        bot_state.cooldowns = data.get("cooldowns", {})
+        bot_state.daily_stop_counts = data.get("daily_stop_counts", {})
+        bot_state.daily_reset_date = data.get("daily_reset_date", "")
 
         # 포지션 복구
         positions_data = data.get("positions", {})
         for prefix, pd in positions_data.items():
+            # 하위 호환: 기존 trade_usdt 필드로 저장된 경우 50:50 균등 분배로 복구
+            if "margin_a" in pd and "margin_b" in pd:
+                m_a = pd["margin_a"]
+                m_b = pd["margin_b"]
+            else:
+                legacy = pd.get("trade_usdt", 0.0)
+                m_a = legacy
+                m_b = legacy
             bot_state.positions[prefix] = PairPosition(
                 prefix       = pd["prefix"],
                 side         = pd["side"],
@@ -101,7 +118,8 @@ async def load_state(bot_state: BotState) -> bool:
                 sym_b        = pd["sym_b"],
                 price_a      = pd["price_a"],
                 price_b      = pd["price_b"],
-                trade_usdt   = pd["trade_usdt"],
+                margin_a     = m_a,
+                margin_b     = m_b,
                 entry_time   = _str_to_dt(pd["entry_time"]),
                 entry_z_score= pd.get("entry_z_score", 0.0),
             )

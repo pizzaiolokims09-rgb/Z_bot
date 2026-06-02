@@ -29,26 +29,36 @@ IS_PAPER_TRADING = os.getenv("IS_PAPER_TRADING", "true").lower() == "true"
 #   False: 바이낸스 실거래(Mainnet) 네트워크 사용
 USE_TESTNET = os.getenv("USE_TESTNET", "true").lower() == "true"
 
-# ── 거래 대상 페어 목록 (A심볼, B심볼) ──────────────────────────────────────
+# ── 거래 대상 페어 목록 (A심볼, B심볼) — 20개 유니버스 ────────────────────────
 # 바이낸스 선물 표기법: spot 심볼로 입력하면 내부에서 :USDT 변환
 PAIRS_TO_TRADE = [
-    ("BTC/USDT",      "ETH/USDT"),
-    ("XRP/USDT",      "XLM/USDT"),
-    ("SOL/USDT",      "AVAX/USDT"),
-    ("DOGE/USDT",     "1000SHIB/USDT"),
-    ("LINK/USDT",     "DOT/USDT"),
-    ("ARB/USDT",      "OP/USDT"),
-    ("LTC/USDT",      "BCH/USDT"),
-    ("ADA/USDT",      "TRX/USDT"),
-    ("UNI/USDT",      "AAVE/USDT"),
-    ("SAND/USDT",     "MANA/USDT"),
+    ("BTC/USDT",      "ETH/USDT"),         # 시총 1위-2위
+    ("LTC/USDT",      "BCH/USDT"),         # OG 결제형
+    ("XRP/USDT",      "XLM/USDT"),         # 크로스보더 결제
+    ("ADA/USDT",      "TRX/USDT"),         # L1 스마트컨트랙트
+    ("ATOM/USDT",     "TIA/USDT"),         # 코스모스 생태계
+    ("SOL/USDT",      "AVAX/USDT"),        # 고성능 L1
+    ("ARB/USDT",      "OP/USDT"),          # 이더리움 L2
+    ("APT/USDT",      "SUI/USDT"),         # Move 기반 L1
+    ("POL/USDT",      "NEAR/USDT"),        # L1 인프라
+    ("UNI/USDT",      "AAVE/USDT"),        # DeFi 블루칩
+    ("HBAR/USDT",     "ALGO/USDT"),        # 엔터프라이즈 L1
+    ("SEI/USDT",      "INJ/USDT"),         # 신세대 L1
+    ("LINK/USDT",     "DOT/USDT"),         # 인프라/크로스체인
+    ("FIL/USDT",      "AR/USDT"),          # 탈중앙 스토리지
+    ("STX/USDT",      "ORDI/USDT"),        # 비트코인 생태계
+    ("RENDER/USDT",   "FET/USDT"),         # AI 섹터
+    ("WLD/USDT",      "ARKM/USDT"),        # 샘 알트먼 & AI 테마
+    # ("JUP/USDT",      "RAY/USDT"),         # 솔라나 DEX 테마 (Testnet 미지원, 실계좌 전환 시 주석 해제)
+    ("DOGE/USDT",     "1000SHIB/USDT"),    # 밈 대형 (Top 15)
+    ("1000PEPE/USDT", "1000BONK/USDT"),    # 밈 대형 (Top 30)
 ]
 
 # ── 레버리지 ────────────────────────────────────────────────────────────────
 LEVERAGE = 5   # 바이낸스 선물 레버리지 배수 (봇 시작 시 API로 자동 세팅)
 
 # ── 최대 동시 진입 슬롯 ─────────────────────────────────────────────────────
-# 10개 페어를 감시하되, 동시에 포지션을 보유할 수 있는 최대 페어 수
+# 20개 페어를 감시하되, 동시에 포지션을 보유할 수 있는 최대 페어 수
 MAX_ACTIVE_PAIRS = int(os.getenv("MAX_ACTIVE_PAIRS", "5"))
 
 # ── 동적 비중 설정 ──────────────────────────────────────────────────────────
@@ -60,30 +70,49 @@ ALLOCATION_PER_PAIR = 0.14
 # 페이퍼 트레이딩 시 가상 초기 잔고 (실거래에서는 무시됨)
 PAPER_INITIAL_BALANCE = 1000.0
 
-# ── 스프레드/Z-Score 엔진 설정 ───────────────────────────────────────────────
-# 가격 비율(ratio = price_A / price_B) 계산에 사용할 데이터 포인트 수
-# 1초 폴링 기준: 3600 = 약 1시간
-RATIO_WINDOW = 3600
+# ── 듀얼 윈도우 스프레드/Z-Score 엔진 설정 ───────────────────────────────────
+# Window A (스윙 타점): 24시간 — 묵직한 펀더멘털 괴리 사냥
+RATIO_WINDOW_SWING = 8640    # 10초 폴링 x 8640 = 24시간
+ENTRY_Z_SCORE_SWING = 2.5   # |Z| >= 2.5 → 스윙 진입
+
+# Window B (단기 타점): 12시간 — 급등락 순간 극단적 이격 사냥
+RATIO_WINDOW_SHORT = 4320   # 10초 폴링 x 4320 = 12시간
+ENTRY_Z_SCORE_SHORT = 3.0   # |Z| >= 3.0 → 단기 진입
 
 # [레거시] 고정 % 기반 임계치 (하위 호환용 — 실 판단은 Z-Score 기반으로 전환됨)
 ENTRY_THRESHOLD_PCT = 0.3
 EXIT_THRESHOLD_PCT  = 0.05
-STOP_LOSS_PCT       = 1.5
+STOP_LOSS_PCT       = 2.0    # 2.0% — 고정 괴리율 손절 (1.5 → 2.0 상향, 휩쏘 방어)
 
 # ── 볼린저 밴드 기반 동적 진입선 (Z-Score) ────────────────────────────────────
 # 하이브리드 진입: 아래 두 조건을 동시에 만족해야 진입 발생 (AND 조건)
-#   조건 A: |Z-Score| >= ENTRY_Z_SCORE
+#   조건 A: |Z-Score| >= ENTRY_Z_SCORE_SWING or ENTRY_Z_SCORE_SHORT
 #   조건 B: |괴리율(dev_pct)| >= MIN_SPREAD_THRESHOLD (%)
-MIN_SPREAD_THRESHOLD = 0.5    # 0.5% — Ratio가 이동평균 대비 최소 이만큼 벌어져야 진입
+MIN_SPREAD_THRESHOLD = 1.5    # 1.5% — 수수료를 떼고도 남을 확실한 안전 마진 (0.8 → 1.5 상향)
 
-ENTRY_Z_SCORE      = 2.0    # |Z| >= 2.0 → 밴드 상/하단 터치 시 진입
-EXIT_Z_SCORE       = 0.5    # |Z| <= 0.5 → 평균 회귀 시 익절
-STOP_LOSS_Z_SCORE  = 4.0    # |Z| >= 4.0 → 극단적 디커플링 손절
+EXIT_Z_SCORE       = 0.3    # |Z| <= 0.3 → 평균 회귀 시 익절
+STOP_LOSS_Z_SCORE  = 3.5    # |Z| >= 3.5 → 극단적 디커플링 손절 (유지)
 
 # ── 손절 후 재진입 쿨다운 ────────────────────────────────────────────────────
 # 손절 발생 후 동일 페어에 재진입하기까지 최소 대기 시간 (초)
-# 진입→손절 무한 루프 방지용
-STOP_LOSS_COOLDOWN_SEC = int(os.getenv("STOP_LOSS_COOLDOWN_SEC", "900"))  # 15분
+# 진입→손절 무한 루프 방지용 (30분 -> 4시간으로 대폭 연장)
+STOP_LOSS_COOLDOWN_SEC = int(os.getenv("STOP_LOSS_COOLDOWN_SEC", "14400"))  # 4시간
+
+# ── 페어별 일일 손절 제한 ────────────────────────────────────────────────────
+# 한 페어에서 이 횟수 이상 손절 발생 시 당일 해당 페어 거래 중단
+MAX_STOP_LOSS_PER_PAIR = 3
+
+# ── 최대 보유 시간 ───────────────────────────────────────────────────────────
+# 포지션 보유 시간이 이 값(초)을 초과하고 Net PnL이 0 이하이면 강제 청산
+MAX_HOLD_SECONDS = 172800   # 48시간 (7200 → 172800 대폭 상향, 평균 회귀 대기)
+
+# ── 추세 필터 ────────────────────────────────────────────────────────────────
+# ratio의 선형 회귀 기울기가 이 값을 초과하면 추세로 판정 → 신규 진입 차단
+TREND_SLOPE_THRESHOLD = 0.00015   # 0.0003 → 0.00015 하향 (추세 필터 강화)
+
+# ── 워밍업 최소 비율 ─────────────────────────────────────────────────────────
+# RATIO_WINDOW의 이 비율 이상 채워야 신호 활성화 (0.5 = 50%)
+MIN_WARMUP_RATIO = 0.5
 
 # ── 글로벌 킬 스위치 ─────────────────────────────────────────────────────────
 # 봇 시작 시점 자본금 대비 이 비율만큼 손실 발생 시 전 포지션 강제 청산 + 봇 종료
@@ -91,7 +120,7 @@ STOP_LOSS_COOLDOWN_SEC = int(os.getenv("STOP_LOSS_COOLDOWN_SEC", "900"))  # 15�
 MAX_DRAWDOWN_LIMIT = -0.05
 
 # ── 폴링 간격 (초) ──────────────────────────────────────────────────────────
-POLL_INTERVAL_SEC = 1.0
+POLL_INTERVAL_SEC = 10.0   # 10초 폴링 (노이즈 감소)
 
 # ── 주문 재시도 설정 ────────────────────────────────────────────────────────
 ORDER_RETRY_COUNT   = 3
@@ -100,9 +129,18 @@ ORDER_RETRY_WAIT    = 2.0   # 초
 # ── 로그 파일 경로 ──────────────────────────────────────────────────────────
 LOG_FILE = "bot.log"
 
-# ── 바이낸스 Taker 수수료 ────────────────────────────────────────────────────
-# 시장가 1회당 0.05% → 1 사이클(진입 2회 + 청산 2회) = 0.05% * 4 = 0.2%
+# ── 바이낸스 수수료 ──────────────────────────────────────────────────────────
+# 시장가(Taker) 1회당 0.05%
 TAKER_FEE_RATE = 0.0005   # 0.05%
+# 지정가(Maker) 1회당 0.02%
+MAKER_FEE_RATE = 0.0002   # 0.02%
+
+# 바이낸스 선물 최소 주문 명목가치 (USDT) — 이 미만이면 진입 스킵
+MIN_NOTIONAL_USDT = 5.5   # 실제 규칙 5 USDT, 여유분 포함 5.5
+
+# ── 지정가(Maker) 익절 설정 ──────────────────────────────────────────────────
+# 지정가 익절 주문 후 미체결 시 시장가 Fallback 전환 대기 시간 (초)
+MAKER_ORDER_TIMEOUT = 60   # 60초
 
 # ── 서버 재구동 시 상태 복구 파일 ────────────────────────────────────────────
 STATE_FILE = "bot_state.json"
@@ -112,3 +150,7 @@ STATE_FILE = "bot_state.json"
 # 전 페어 신규 진입을 일시 차단 (기존 포지션 청산 감시는 계속 작동)
 MAX_BTC_VOLATILITY = 2.0   # 15분 변동성 2% 초과 시 폭주 판정
 BTC_VOLATILITY_CHECK_INTERVAL = 30   # BTC 변동성 체크 주기 (초)
+
+# ── 워밍업 배치 크기 ─────────────────────────────────────────────────────────
+# 20페어 동시 워밍업 시 Rate Limit 방어를 위해 이 개수씩 배치 처리
+WARMUP_BATCH_SIZE = 5

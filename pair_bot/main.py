@@ -1,6 +1,7 @@
 # =============================================================================
 # pair_bot/main.py
-# 페어 트레이딩 봇 — 메인 진입점 (5개 페어 병렬 감시 + 텔레그램 연동)
+# 페어 트레이딩 봇 — 메인 진입점 (20개 페어 병렬 감시 + 텔레그램 연동)
+# 고승률 스나이퍼 & 수수료 최적화 모드
 # 실행: python main.py
 # =============================================================================
 
@@ -9,6 +10,7 @@ import logging
 import math
 import sys
 import time
+from datetime import date, datetime
 from logging.handlers import RotatingFileHandler
 
 import ccxt.async_support as ccxt_async
@@ -21,6 +23,8 @@ from config import (
     API_KEY, API_SECRET, USE_TESTNET,
     MAX_BTC_VOLATILITY, BTC_VOLATILITY_CHECK_INTERVAL,
     STOP_LOSS_COOLDOWN_SEC,
+    MAX_STOP_LOSS_PER_PAIR, MAX_HOLD_SECONDS,
+    WARMUP_BATCH_SIZE, EXIT_Z_SCORE,
 )
 from spread_engine      import SpreadEngine
 from risk_manager       import RiskManager
@@ -129,38 +133,50 @@ async def _execute_close(
 ):
     """청산 주문 → Net PnL 계산(수수료 차감) → 상태 정리 → 텔레그램 알림 → CSV 기록 → 상태 저장."""
     pos = bot_state.positions.get(prefix)
+    is_maker = (reason == "TAKE_PROFIT")
 
-    # Net PnL 계산 — Taker 수수료(0.2%) 완전 차감
+    # Net PnL 계산 — 익절 시 Maker, 그 외 Taker 수수료 차감
     pnl_usdt, pnl_pct = 0.0, 0.0
     if pos:
-        pnl_usdt, pnl_pct = bot_state.calc_pnl(pos, price_a, price_b, LEVERAGE)
+        pnl_usdt, pnl_pct = bot_state.calc_pnl(
+            pos, price_a, price_b, LEVERAGE, is_maker_exit=is_maker
+        )
         bot_state.record_trade(pnl_usdt)
         bot_state.positions.pop(prefix, None)
 
+    fee_tag = "Maker" if is_maker else "Taker"
     if reason == "STOP_LOSS":
         logger.warning(
             f"[{prefix}] 손절 발동 | dev={dev:+.3f}% | "
-            f"Net PnL={pnl_usdt:+.4f} USDT ({pnl_pct:+.3f}%) [수수료 차감]"
+            f"Net PnL={pnl_usdt:+.4f} USDT ({pnl_pct:+.3f}%) [{fee_tag} 수수료]"
         )
     elif reason == "MANUAL":
         logger.info(
-            f"[{prefix}] 수동 청산 | Net PnL={pnl_usdt:+.4f} USDT ({pnl_pct:+.3f}%) [수수료 차감]"
+            f"[{prefix}] 수동 청산 | Net PnL={pnl_usdt:+.4f} USDT ({pnl_pct:+.3f}%) [{fee_tag} 수수료]"
         )
     elif reason == "KILL_SWITCH":
         logger.critical(
-            f"[{prefix}] 킬스위치 청산 | Net PnL={pnl_usdt:+.4f} USDT [수수료 차감]"
+            f"[{prefix}] 킬스위치 청산 | Net PnL={pnl_usdt:+.4f} USDT [{fee_tag} 수수료]"
         )
     else:
         logger.info(
             f"[{prefix}] 익절 | 괴리 회귀 | dev={dev:+.3f}% | "
-            f"Net PnL={pnl_usdt:+.4f} USDT ({pnl_pct:+.3f}%) [수수료 차감]"
+            f"Net PnL={pnl_usdt:+.4f} USDT ({pnl_pct:+.3f}%) [{fee_tag} 수수료]"
         )
 
-    await order_executor.close_pair(
-        sym_a=sym_a, price_a=price_a,
-        sym_b=sym_b, price_b=price_b,
-        reason=reason, pair_prefix=prefix,
-    )
+    # 익절 시 지정가(Maker), 그 외 시장가(Taker) 청산
+    if is_maker and pos:
+        await order_executor.close_pair_limit(
+            sym_a=sym_a, price_a=price_a,
+            sym_b=sym_b, price_b=price_b,
+            pos_side=pos.side, pair_prefix=prefix,
+        )
+    else:
+        await order_executor.close_pair(
+            sym_a=sym_a, price_a=price_a,
+            sym_b=sym_b, price_b=price_b,
+            reason=reason, pair_prefix=prefix,
+        )
     risk_manager.close_position(prefix)
     await notifier.send_exit(prefix, pnl_usdt, pnl_pct, reason)
 
@@ -277,6 +293,51 @@ async def check_kill_switch(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 워밍업 데이터 조회 (과거 1m 봉 가져와서 윈도우 채우기)
+# ─────────────────────────────────────────────────────────────────────────────
+async def prefetch_warmup_data(exchange: ccxt_async.Exchange, sym_a: str, sym_b: str, spread_engine: SpreadEngine, prefix: str):
+    """
+    1분봉 1440개(24시간 분량)를 가져와서 10초 폴링(1분에 6개) 효과를 내도록
+    듀얼 윈도우(스윙 8640 / 단기 4320)에 채워 넣습니다.
+    """
+    logger = logging.getLogger("pair_bot")
+    try:
+        limit = 1440  # 24시간 = 1440분
+        # 비동기로 A, B 심볼 1분봉 가져오기
+        ohlcv_a, ohlcv_b = await asyncio.gather(
+            exchange.fetch_ohlcv(sym_a, timeframe="1m", limit=limit),
+            exchange.fetch_ohlcv(sym_b, timeframe="1m", limit=limit),
+            return_exceptions=True
+        )
+        
+        if isinstance(ohlcv_a, Exception) or isinstance(ohlcv_b, Exception):
+            logger.warning(f"[{prefix}] 과거 데이터 조회 실패 (예외 발생) - 워밍업 건너뜀")
+            return
+            
+        if not ohlcv_a or not ohlcv_b:
+            logger.warning(f"[{prefix}] 과거 데이터 없음 - 워밍업 건너뜀")
+            return
+            
+        # 시간축 맞추기 위해 가장 최근 N개 맞춤
+        min_len = min(len(ohlcv_a), len(ohlcv_b))
+        ohlcv_a = ohlcv_a[-min_len:]
+        ohlcv_b = ohlcv_b[-min_len:]
+        
+        # 4번 인덱스가 종가(Close)
+        for i in range(min_len):
+            price_a = ohlcv_a[i][4]
+            price_b = ohlcv_b[i][4]
+            if price_b > 0:
+                # 1분(60초) = 10초 폴링 * 6회 반복 삽입으로 가중치 맞춤
+                for _ in range(6):
+                    spread_engine.update(price_a, price_b)
+                    
+        logger.info(f"[{prefix}] 과거 데이터 {min_len}분치 로드 완료 (window={spread_engine.window_size}) -> 즉시 거래 가능!")
+    except Exception as e:
+        logger.warning(f"[{prefix}] 워밍업 데이터 로드 중 오류: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 단일 페어 감시 루프 (Z-Score / 진입 / 청산 핵심 로직 유지)
 # ─────────────────────────────────────────────────────────────────────────────
 async def pair_loop(
@@ -300,11 +361,37 @@ async def pair_loop(
     spread_engine = SpreadEngine()   # 이 페어 전용 Z-Score 계산기
     risk_manager  = RiskManager()    # 이 페어 전용 포지션 상태
 
-    last_stop_loss_time = 0.0  # 마지막 손절 발생 시각 (time.time())
+    entry_timestamp = 0.0      # 포지션 진입 시각 (time.time() 기반, 시간 기반 청산용)
     reconnect_wait = 5
+
+    # ── 봇 상태(bot_state)에서 기존 포지션 복구 ──
+    if prefix in bot_state.positions:
+        pos = bot_state.positions[prefix]
+        risk_manager.position_side = pos.side
+        risk_manager.entry_ratio = pos.entry_ratio
+        risk_manager.entry_notional = pos.total_margin
+        try:
+            if isinstance(pos.entry_time, str):
+                dt = datetime.strptime(pos.entry_time, "%Y-%m-%d %H:%M:%S")
+                entry_timestamp = dt.timestamp()
+            else:
+                entry_timestamp = pos.entry_time.timestamp()
+            logger.info(f"[{prefix}] 로컬 상태(RiskManager) 복구 완료: {pos.side}, ratio={pos.entry_ratio:.5f}")
+        except Exception as e:
+            logger.error(f"[{prefix}] 진입 시간 복구 실패: {e}")
+
+    # ── 워밍업 데이터 프리패치 ──
+    await prefetch_warmup_data(exchange, sym_a, sym_b, spread_engine, prefix)
 
     while True:
         try:
+            # ── 자정 리셋 (일일 손절 카운터) ───────────────────────────────
+            today_str = date.today().isoformat()
+            if bot_state.daily_reset_date != today_str:
+                bot_state.daily_stop_counts.clear()
+                bot_state.daily_reset_date = today_str
+                logger.info("일일 손절 카운터 전체 리셋")
+
             # ── 0. 수동 청산 요청 확인 (텔레그램 버튼) ──────────────────────
             if prefix in bot_state.manual_close_requests:
                 bot_state.manual_close_requests.discard(prefix)
@@ -341,21 +428,23 @@ async def pair_loop(
 
             bot_state.latest_dev[prefix] = dev
 
-            # 주기적 상태 로그 (10초마다 DEBUG → bot.log에 기록)
-            if int(time.time()) % 10 == 0:
+            # 주기적 상태 로그 (60초마다 DEBUG → bot.log에 기록)
+            if int(time.time()) % 60 == 0:
                 pnl_est = (
                     risk_manager.estimate_pnl_pct(ratio)
                     if risk_manager.has_position else 0.0
                 )
                 logger.debug(
                     f"[{prefix}] ratio={ratio:.6f} | dev={dev:+.3f}% | "
-                    f"z={state['z_score']:+.3f} | window={window} | "
+                    f"zSw={state['z_score_swing']:+.3f} zSh={state['z_score_short']:+.3f} | "
+                    f"win={window} | slope={state['slope']:.6f} | "
+                    f"trend={'Y' if state['is_trending'] else 'N'} | "
                     f"pos={'O' if risk_manager.has_position else '-'} | "
-                    f"추정PnL={pnl_est:+.3f}%"
+                    f"PnL={pnl_est:+.3f}% | SL={bot_state.daily_stop_counts.get(prefix, 0)}/{MAX_STOP_LOSS_PER_PAIR}"
                 )
 
             # ── 3. 동적 포지션 사이징 — 가용 잔고의 14% (핵심 자금 관리 유지) ─
-            trade_usdt = 0.0
+            total_margin = 0.0
             if not risk_manager.has_position and signal.startswith("ENTRY"):
                 # 봇 정지 상태면 진입 스킵 (기존 포지션 관리는 계속)
                 if not bot_state.is_accepting_entries:
@@ -368,11 +457,19 @@ async def pair_loop(
                     continue
 
                 # 손절 후 재진입 쿨다운 (진입→손절 무한루프 방지)
-                elapsed = time.time() - last_stop_loss_time
+                elapsed = time.time() - bot_state.cooldowns.get(prefix, 0.0)
                 if elapsed < STOP_LOSS_COOLDOWN_SEC:
                     remaining = int(STOP_LOSS_COOLDOWN_SEC - elapsed)
                     logger.debug(
                         f"[{prefix}] 손절 쿨다운 중 — 재진입까지 {remaining}초 남음"
+                    )
+                    await asyncio.sleep(POLL_INTERVAL_SEC)
+                    continue
+
+                # 일일 손절 횟수 제한 (한 페어에서 연속 손실 방지)
+                if bot_state.daily_stop_counts.get(prefix, 0) >= MAX_STOP_LOSS_PER_PAIR:
+                    logger.debug(
+                        f"[{prefix}] 일일 손절 한도 도달 ({bot_state.daily_stop_counts.get(prefix, 0)}/{MAX_STOP_LOSS_PER_PAIR}) — 당일 진입 중단"
                     )
                     await asyncio.sleep(POLL_INTERVAL_SEC)
                     continue
@@ -401,19 +498,30 @@ async def pair_loop(
                         continue
 
                     free_bal   = await order_executor.get_free_balance()
-                    # 페어 총 배분 = 잔고 x 14%, 각 레그(롱/숏) = 그 절반 (7%)
-                    trade_usdt = (free_bal * ALLOCATION_PER_PAIR) / 2.0
+                    # 페어 총 배분 = 잔고 x 14% (두 레그 합산 총액)
+                    total_margin = free_bal * ALLOCATION_PER_PAIR
                     logger.info(
                         f"[{prefix}] 잔고={free_bal:.2f} USDT | "
-                        f"레그당={trade_usdt:.2f} USDT (배분={ALLOCATION_PER_PAIR * 100:.0f}%)"
+                        f"페어총액={total_margin:.2f} USDT (배분={ALLOCATION_PER_PAIR * 100:.0f}%)"
                     )
 
+                    # 변동성 가중치 계산 (워밍업 미완료 시 50:50 Fallback)
+                    vol_a, vol_b = spread_engine.get_volatilities()
+
                     # ── 4. 신호 처리 (기존 진입 조건 로직 유지) ─────────────────
-                    if signal == "ENTRY_SHORT_A_LONG_B" and trade_usdt > 0:
-                        sizing = risk_manager.calc_qty(price_a, price_b, trade_usdt)
+                    if signal == "ENTRY_SHORT_A_LONG_B" and total_margin > 0:
+                        sizing = risk_manager.calc_qty(price_a, price_b, total_margin, vol_a, vol_b)
+                        if sizing is None:
+                            logger.warning(f"[{prefix}] Min Notional 미달 — 진입 스킵")
+                            await asyncio.sleep(POLL_INTERVAL_SEC)
+                            continue
                         logger.info(
                             f"[{prefix}] 진입 시그널 발생 | A Short / B Long | "
                             f"z={state['z_score']:+.3f} dev={dev:+.3f}%"
+                        )
+                        logger.info(
+                            f"[{prefix}] 변동성 헷징: vol_A={vol_a:.6f} vol_B={vol_b:.6f} | "
+                            f"배분 A={sizing['margin_a']:.1f} B={sizing['margin_b']:.1f} USDT"
                         )
                         try:
                             await order_executor.open_pair(
@@ -426,24 +534,35 @@ async def pair_loop(
                             await notifier.send_legging_alert(prefix, str(e))
                             await asyncio.sleep(POLL_INTERVAL_SEC)
                             continue
-                        risk_manager.open_position("SHORT_A_LONG_B", ratio, trade_usdt, prefix)
+                        risk_manager.open_position("SHORT_A_LONG_B", ratio, sizing['margin_a'] + sizing['margin_b'], prefix)
                         bot_state.positions[prefix] = PairPosition(
                             prefix=prefix, side="SHORT_A_LONG_B",
                             entry_ratio=ratio, sym_a=sym_a, sym_b=sym_b,
-                            price_a=price_a, price_b=price_b, trade_usdt=trade_usdt,
+                            price_a=price_a, price_b=price_b,
+                            margin_a=sizing['margin_a'], margin_b=sizing['margin_b'],
                             entry_time=_now_kst(),
                             entry_z_score=state["z_score"],
                         )
+                        entry_timestamp = time.time()
                         await notifier.send_entry(
-                            prefix, sym_a, "sell", price_a, sym_b, "buy", price_b, trade_usdt
+                            prefix, sym_a, "sell", price_a, sym_b, "buy", price_b,
+                            sizing['margin_a'], sizing['margin_b'],
                         )
-                        await save_state(bot_state)  # 진입 직후 상태 저장
+                        await save_state(bot_state)
 
-                    elif signal == "ENTRY_LONG_A_SHORT_B" and trade_usdt > 0:
-                        sizing = risk_manager.calc_qty(price_a, price_b, trade_usdt)
+                    elif signal == "ENTRY_LONG_A_SHORT_B" and total_margin > 0:
+                        sizing = risk_manager.calc_qty(price_a, price_b, total_margin, vol_a, vol_b)
+                        if sizing is None:
+                            logger.warning(f"[{prefix}] Min Notional 미달 — 진입 스킵")
+                            await asyncio.sleep(POLL_INTERVAL_SEC)
+                            continue
                         logger.info(
                             f"[{prefix}] 진입 시그널 발생 | A Long / B Short | "
                             f"z={state['z_score']:+.3f} dev={dev:+.3f}%"
+                        )
+                        logger.info(
+                            f"[{prefix}] 변동성 헷징: vol_A={vol_a:.6f} vol_B={vol_b:.6f} | "
+                            f"배분 A={sizing['margin_a']:.1f} B={sizing['margin_b']:.1f} USDT"
                         )
                         try:
                             await order_executor.open_pair(
@@ -456,23 +575,61 @@ async def pair_loop(
                             await notifier.send_legging_alert(prefix, str(e))
                             await asyncio.sleep(POLL_INTERVAL_SEC)
                             continue
-                        risk_manager.open_position("LONG_A_SHORT_B", ratio, trade_usdt, prefix)
+                        risk_manager.open_position("LONG_A_SHORT_B", ratio, sizing['margin_a'] + sizing['margin_b'], prefix)
                         bot_state.positions[prefix] = PairPosition(
                             prefix=prefix, side="LONG_A_SHORT_B",
                             entry_ratio=ratio, sym_a=sym_a, sym_b=sym_b,
-                            price_a=price_a, price_b=price_b, trade_usdt=trade_usdt,
+                            price_a=price_a, price_b=price_b,
+                            margin_a=sizing['margin_a'], margin_b=sizing['margin_b'],
                             entry_time=_now_kst(),
                             entry_z_score=state["z_score"],
                         )
+                        entry_timestamp = time.time()
                         await notifier.send_entry(
-                            prefix, sym_a, "buy", price_a, sym_b, "sell", price_b, trade_usdt
+                            prefix, sym_a, "buy", price_a, sym_b, "sell", price_b,
+                            sizing['margin_a'], sizing['margin_b'],
                         )
-                        await save_state(bot_state)  # 진입 직후 상태 저장
+                        await save_state(bot_state)
 
             elif risk_manager.has_position:
+                # ── 시간 기반 강제 청산 (MAX_HOLD_SECONDS 초과 + 손실 시) ────
+                if entry_timestamp > 0:
+                    hold_sec = time.time() - entry_timestamp
+                    if hold_sec >= MAX_HOLD_SECONDS:
+                        pos = bot_state.positions.get(prefix)
+                        if pos:
+                            net_pnl, _ = bot_state.calc_pnl(pos, price_a, price_b, LEVERAGE)
+                            if net_pnl <= 0:
+                                logger.warning(
+                                    f"[{prefix}] 보유 시간 초과 ({hold_sec:.0f}초) + "
+                                    f"손실({net_pnl:+.2f} USDT) → 강제 청산"
+                                )
+                                await _execute_close(
+                                    prefix, "STOP_LOSS", price_a, price_b,
+                                    sym_a, sym_b, risk_manager, order_executor,
+                                    bot_state, notifier, logger, dev,
+                                    z_score=state["z_score"],
+                                )
+                                bot_state.cooldowns[prefix] = time.time()
+                                bot_state.daily_stop_counts[prefix] = bot_state.daily_stop_counts.get(prefix, 0) + 1
+                                await save_state(bot_state)  # 쿨다운 및 손절 횟수 상태 파일에 영구 기록
+                                entry_timestamp = 0.0
+                                await asyncio.sleep(POLL_INTERVAL_SEC)
+                                continue
+
+                # ── Z-Score Zero-Cross 익절 안전장치 (급등락 대비 보완) ──
+                # Z-Score가 0을 완전히 관통해서 반대편으로 가버린 경우 강제 익절 처리
+                pos = bot_state.positions.get(prefix)
+                if pos and signal != "STOP":
+                    # 숏A 롱B 진입시 (Z>0에서 진입) -> Z가 0 이하로 내려오면 익절
+                    if pos.entry_z_score > 0 and state["z_score"] <= EXIT_Z_SCORE:
+                        signal = "EXIT"
+                    # 롱A 숏B 진입시 (Z<0에서 진입) -> Z가 0 이상으로 올라가면 익절
+                    elif pos.entry_z_score < 0 and state["z_score"] >= -EXIT_Z_SCORE:
+                        signal = "EXIT"
+
                 # 청산 / 손절 판단 — 공통 핸들러로 위임 (포지션 보유 시에만 진입)
-                # 손절은 Z-Score STOP 시그널(abs_z >= 4.0)에만 의존
-                # (레거시 dev% 기반 should_stop_loss는 Z-Score 진입과 충돌하므로 제거됨)
+                # 손절은 Z-Score STOP 시그널(abs_z >= 3.5)에만 의존
                 if signal == "STOP":
                     await _execute_close(
                         prefix, "STOP_LOSS", price_a, price_b,
@@ -480,17 +637,22 @@ async def pair_loop(
                         bot_state, notifier, logger, dev,
                         z_score=state["z_score"],
                     )
-                    last_stop_loss_time = time.time()  # 쿨다운 타이머 시작
+                    bot_state.cooldowns[prefix] = time.time()  # 쿨다운 타이머 시작
+                    bot_state.daily_stop_counts[prefix] = bot_state.daily_stop_counts.get(prefix, 0) + 1  # 일일 손절 카운터 증가
+                    await save_state(bot_state)  # 쿨다운 및 손절 횟수 상태 파일에 영구 기록
+                    entry_timestamp = 0.0
 
                 elif signal == "EXIT":
-                    # 익절 안전장치: Net PnL 산정 후 0 초과 시에만 청산
+                    # 익절 안전장치: Maker 수수료 기준 Net PnL 0 초과 시에만 청산
                     pos = bot_state.positions.get(prefix)
                     if pos:
-                        net_pnl, _ = bot_state.calc_pnl(pos, price_a, price_b, LEVERAGE)
+                        net_pnl, _ = bot_state.calc_pnl(
+                            pos, price_a, price_b, LEVERAGE, is_maker_exit=True
+                        )
                         if net_pnl <= 0:
                             logger.debug(
                                 f"[{prefix}] EXIT 시그널 무시 — "
-                                f"Net PnL={net_pnl:+.4f} USDT (수수료 미충성)"
+                                f"Net PnL={net_pnl:+.4f} USDT (Maker 수수료 미충당)"
                             )
                             await asyncio.sleep(POLL_INTERVAL_SEC)
                             continue
@@ -500,6 +662,7 @@ async def pair_loop(
                         bot_state, notifier, logger, dev,
                         z_score=state["z_score"],
                     )
+                    entry_timestamp = 0.0
 
             # ── 5. 킬 스위치 검사 (30초마다) ────────────────────────────────────
             if int(time.time()) % 30 == 0:
@@ -524,7 +687,7 @@ async def pair_loop(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 메인 루프 — 5개 페어 병렬 + 텔레그램 앱 동시 실행
+# 메인 루프 — 20개 페어 병렬 + 텔레그램 앱 동시 실행
 # ─────────────────────────────────────────────────────────────────────────────
 async def main_loop():
     logger = logging.getLogger("pair_bot")
@@ -546,7 +709,7 @@ async def main_loop():
     # 가격 조회용 비동기 exchange (공개 REST API 전용 — API 키 불필요)
     # fetch_order_book / fetch_ticker 는 인증 없이 사용 가능한 public 엔드포인트
     exchange = ccxt_async.binanceusdm({
-        "options"        : {"defaultType": "future"},
+        "options"        : {"defaultType": "future", "adjustForTimeDifference": True},
         "enableRateLimit": True,
     })
     logger.info("[거래소] 가격 조회 클라이언트 초기화 완료 (Public API, 인증 없음)")
@@ -588,12 +751,19 @@ async def main_loop():
     else:
         logger.warning("[텔레그램] 토큰 미설정 — 텔레그램 기능 비활성화")
 
-    # ── 10개 페어 루프 + BTC 변동성 모니터 병렬 실행 ──────────────────────────
+    # ── 20개 페어 루프 + BTC 변동성 모니터 병렬 실행 ──────────────────────────
     entry_lock = asyncio.Lock()  # 신규 진입 동시성 제어용 Lock
-    tasks = [
-        pair_loop(sym_a, sym_b, exchange, order_executor, bot_state, notifier, entry_lock)
-        for sym_a, sym_b in PAIRS_TO_TRADE
-    ]
+    tasks = []
+    # Rate Limit 방어: 워밍업을 배치(5개씩)로 나눠 순차 시작
+    for batch_start in range(0, len(PAIRS_TO_TRADE), WARMUP_BATCH_SIZE):
+        batch = PAIRS_TO_TRADE[batch_start:batch_start + WARMUP_BATCH_SIZE]
+        for sym_a, sym_b in batch:
+            tasks.append(
+                pair_loop(sym_a, sym_b, exchange, order_executor, bot_state, notifier, entry_lock)
+            )
+        if batch_start + WARMUP_BATCH_SIZE < len(PAIRS_TO_TRADE):
+            logger.info(f"[워밍업 배치] {batch_start + WARMUP_BATCH_SIZE}/{len(PAIRS_TO_TRADE)}개 시작, 2초 대기...")
+            await asyncio.sleep(2)  # 배치 간 2초 딜레이
     tasks.append(btc_turbulence_monitor(exchange, bot_state, notifier))
 
     try:

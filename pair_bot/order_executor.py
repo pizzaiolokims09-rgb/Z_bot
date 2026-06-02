@@ -3,6 +3,7 @@
 # 실주문(Binance Futures) / 페이퍼 트레이딩 주문 집행기
 # IS_PAPER_TRADING 플래그로 모드 전환
 # 다중 페어 지원: 심볼을 인자로 전달받아 어느 페어든 처리 가능
+# + 지정가(Maker) 익절 청산 & 60초 Fallback
 # =============================================================================
 
 import asyncio
@@ -12,6 +13,7 @@ from config import (
     PAIRS_TO_TRADE, LEVERAGE,
     ORDER_RETRY_COUNT, ORDER_RETRY_WAIT,
     PAPER_INITIAL_BALANCE, ALLOCATION_PER_PAIR,
+    MAKER_ORDER_TIMEOUT,
 )
 
 logger = logging.getLogger("pair_bot")
@@ -84,7 +86,7 @@ class OrderExecutor:
             self._exchange = ccxt.binance({
                 "apiKey"         : API_KEY,
                 "secret"         : API_SECRET,
-                "options"        : {"defaultType": "future"},
+                "options"        : {"defaultType": "future", "adjustForTimeDifference": True},
                 "enableRateLimit": True,
             })
 
@@ -150,6 +152,12 @@ class OrderExecutor:
             )
             return float(bal.get("free", {}).get("USDT", 0.0))
         except Exception as e:
+            if "-1021" in str(e) or "Timestamp" in str(e):
+                logger.warning(f"[가용잔고조회] 시간 오차 감지. 타임스탬프 리동기화 시도...")
+                try:
+                    await asyncio.get_running_loop().run_in_executor(None, self._exchange.load_time_difference)
+                except Exception:
+                    pass
             logger.warning(f"[잔고조회 실패] {e} — 0 반환")
             return 0.0
 
@@ -166,6 +174,12 @@ class OrderExecutor:
             )
             return float(bal.get("total", {}).get("USDT", 0.0))
         except Exception as e:
+            if "-1021" in str(e) or "Timestamp" in str(e):
+                logger.warning(f"[총잔고조회] 시간 오차 감지. 타임스탬프 리동기화 시도...")
+                try:
+                    await asyncio.get_running_loop().run_in_executor(None, self._exchange.load_time_difference)
+                except Exception:
+                    pass
             logger.warning(f"[총잔고조회 실패] {e} — 일시적 통신 오류이므로 킬스위치 판정을 보류합니다.")
             return None
 
@@ -227,8 +241,8 @@ class OrderExecutor:
         reason: str = "EXIT",
         pair_prefix: str = "",
     ):
-        """두 레그를 동시에 청산합니다."""
-        logger.info(f"[{pair_prefix}] [주문청산] reason={reason} | A~{price_a:.4f}, B~{price_b:.4f}")
+        """두 레그를 동시에 시장가 청산합니다. (손절/킬스위치/수동용)"""
+        logger.info(f"[{pair_prefix}] [시장가 청산] reason={reason} | A~{price_a:.4f}, B~{price_b:.4f}")
 
         if IS_PAPER_TRADING:
             pnl_a = self._paper.close_order(sym_a, price_a, pair_prefix)
@@ -244,6 +258,158 @@ class OrderExecutor:
             self._close_real_position(sym_a, pair_prefix),
             self._close_real_position(sym_b, pair_prefix),
         )
+
+    async def close_pair_limit(
+        self,
+        sym_a: str, price_a: float,
+        sym_b: str, price_b: float,
+        pos_side: str,
+        pair_prefix: str = "",
+    ):
+        """
+        두 레그를 지정가(Maker)로 익절 청산합니다.
+        pos_side: "LONG_A_SHORT_B" | "SHORT_A_LONG_B"
+        
+        MAKER_ORDER_TIMEOUT(60초) 이내 체결되지 않으면
+        자동으로 주문 취소 → 시장가(Taker) Fallback 청산.
+        
+        페이퍼 모드에서는 기존 시장가 시뮬레이션으로 처리.
+        """
+        logger.info(
+            f"[{pair_prefix}] [지정가 익절] pos_side={pos_side} | "
+            f"A~{price_a:.4f}, B~{price_b:.4f}"
+        )
+
+        if IS_PAPER_TRADING:
+            pnl_a = self._paper.close_order(sym_a, price_a, pair_prefix)
+            pnl_b = self._paper.close_order(sym_b, price_b, pair_prefix)
+            total  = pnl_a + pnl_b
+            logger.info(
+                f"[{pair_prefix}] [PAPER] 지정가 익절 완료 | "
+                f"총 PnL={total:+.4f} USDT | 잔고={self._paper.balance:.2f} USDT"
+            )
+            return
+
+        # 실거래: 두 레그를 병렬로 지정가 청산 시도
+        await asyncio.gather(
+            self._close_limit_with_fallback(sym_a, pos_side, "A", pair_prefix),
+            self._close_limit_with_fallback(sym_b, pos_side, "B", pair_prefix),
+        )
+
+    # ── 지정가 청산 + Fallback ────────────────────────────────────────────────
+
+    async def _close_limit_with_fallback(
+        self, symbol: str, pos_side: str, leg: str, pair_prefix: str
+    ):
+        """
+        1) 현재 포지션 수량 조회
+        2) 최우선 호가에 지정가(Post-Only) 주문
+        3) MAKER_ORDER_TIMEOUT 초 대기
+        4) 미체결 시 주문 취소 → 시장가 Fallback
+        """
+        try:
+            # 포지션 조회
+            positions = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._exchange.fetch_positions([symbol])
+            )
+            pos = positions[0] if positions else {}
+            contracts = abs(float(pos.get("contracts", 0)))
+            if contracts == 0:
+                logger.info(f"[{pair_prefix}] [지정가] {symbol} 보유 없음, 스킵")
+                return
+
+            # 방향 결정
+            pos_side_raw = pos.get("side")
+            if pos_side_raw == "short":
+                close_side = "buy"
+            elif pos_side_raw == "long":
+                close_side = "sell"
+            else:
+                amt = float(pos.get("info", {}).get("positionAmt", 0))
+                close_side = "sell" if amt > 0 else "buy"
+
+            # 오더북 조회 → 최우선 호가 결정
+            ob = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._exchange.fetch_order_book(symbol, 5)
+            )
+            if close_side == "sell":
+                # Long 청산 → Best Ask에 Sell Limit (더 높은 가격에 팔기)
+                limit_price = ob["asks"][0][0] if ob.get("asks") else None
+            else:
+                # Short 청산 → Best Bid에 Buy Limit (더 낮은 가격에 사기)
+                limit_price = ob["bids"][0][0] if ob.get("bids") else None
+
+            if limit_price is None:
+                logger.warning(
+                    f"[{pair_prefix}] [지정가] {symbol} 호가 없음 → 시장가 Fallback"
+                )
+                await self._close_real_position(symbol, pair_prefix)
+                return
+
+            # 지정가 주문 (Post-Only로 Maker 보장)
+            order = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: self._exchange.create_order(
+                    symbol, "limit", close_side, contracts, limit_price,
+                    {"reduceOnly": True, "timeInForce": "GTX"}  # GTX = Post-Only
+                )
+            )
+            order_id = order["id"]
+            logger.info(
+                f"[{pair_prefix}] [지정가] {symbol} {close_side} {contracts:.4f} "
+                f"@ {limit_price:.4f} 주문 (id={order_id})"
+            )
+
+            # 체결 대기 (MAKER_ORDER_TIMEOUT초)
+            elapsed = 0
+            check_interval = 5  # 5초마다 체결 확인
+            while elapsed < MAKER_ORDER_TIMEOUT:
+                await asyncio.sleep(check_interval)
+                elapsed += check_interval
+                try:
+                    fetched = await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: self._exchange.fetch_order(order_id, symbol)
+                    )
+                    status = fetched.get("status", "")
+                    if status == "closed":
+                        logger.info(
+                            f"[{pair_prefix}] [지정가 체결] {symbol} 완료! "
+                            f"(Maker 수수료 적용, {elapsed}초 소요)"
+                        )
+                        return
+                    elif status == "canceled":
+                        logger.warning(
+                            f"[{pair_prefix}] [지정가] {symbol} 외부 취소됨 → 시장가 Fallback"
+                        )
+                        break
+                except Exception as e:
+                    logger.debug(f"[{pair_prefix}] 주문 상태 조회 오류: {e}")
+
+            # Fallback: 미체결 → 주문 취소 → 시장가 청산
+            logger.warning(
+                f"[{pair_prefix}] [지정가 미체결] {symbol} {MAKER_ORDER_TIMEOUT}초 초과 "
+                f"→ 주문 취소 후 시장가 Fallback"
+            )
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: self._exchange.cancel_order(order_id, symbol)
+                )
+            except Exception as e:
+                logger.debug(f"[{pair_prefix}] 주문 취소 중 오류 (이미 체결?): {e}")
+
+            # 시장가로 잔여 수량 청산
+            await self._close_real_position(symbol, pair_prefix)
+
+        except Exception as e:
+            logger.error(
+                f"[{pair_prefix}] [지정가 실패] {symbol}: {e} → 시장가 Fallback"
+            )
+            try:
+                await self._close_real_position(symbol, pair_prefix)
+            except Exception as e2:
+                logger.critical(
+                    f"[{pair_prefix}] [Fallback 시장가도 실패!] {symbol}: {e2} — 수동 확인 필요!"
+                )
 
     # ── 내부 주문 처리 ────────────────────────────────────────────────────────
 
@@ -293,7 +459,7 @@ class OrderExecutor:
             )
 
     async def _close_real_position(self, symbol: str, pair_prefix: str = ""):
-        """실거래 포지션 전량 청산 (reduceOnly)."""
+        """실거래 포지션 전량 시장가 청산 (reduceOnly)."""
         for attempt in range(1, ORDER_RETRY_COUNT + 1):
             try:
                 positions = await asyncio.get_running_loop().run_in_executor(

@@ -4,14 +4,14 @@
 # =============================================================================
 
 import logging
-from config import LEVERAGE, STOP_LOSS_PCT
+from config import LEVERAGE, STOP_LOSS_PCT, MIN_NOTIONAL_USDT
 
 logger = logging.getLogger("pair_bot")
 
 
 class RiskManager:
     """
-    - 달러 기준 1:1 포지션 사이징 (델타 중립)
+    - 변동성 가중치 기반 비대칭 포지션 사이징 (Delta Neutral)
     - 현재 포지션 상태 추적
     - 손절 조건 판단
     """
@@ -29,30 +29,54 @@ class RiskManager:
 
     # ── 수량 계산 ─────────────────────────────────────────────────────────────
 
-    def calc_qty(self, price_a: float, price_b: float, trade_usdt: float) -> dict:
+    def calc_qty(
+        self,
+        price_a: float,
+        price_b: float,
+        total_margin_usdt: float,
+        vol_a: float = 1.0,
+        vol_b: float = 1.0,
+    ) -> dict | None:
         """
-        trade_usdt 기준으로 달러 중립 수량을 계산합니다.
+        변동성 역가중치(Volatility Parity) 기반으로 비대칭 수량을 계산합니다.
 
-        trade_usdt: 한 레그에 투입할 증거금(USDT) — 계좌 잔고 x ALLOCATION_PER_PAIR / 2
+        total_margin_usdt: 두 레그 합산 총 증거금 (잔고 x ALLOCATION_PER_PAIR)
+        vol_a, vol_b: 각 코인의 수익률 표준편차 (SpreadEngine.get_volatilities())
+            - 워밍업 미완료 시 (1.0, 1.0) → 기존 50:50 균등 배분과 동일
+
         반환값:
-            {
-                "qty_a"        : float,  A 코인 수량
-                "qty_b"        : float,  B 코인 수량
-                "notional_a"   : float,  A 명목가치(USDT)
-                "notional_b"   : float,  B 명목가치(USDT)
-                "margin_each"  : float,  레그당 증거금(USDT)
-            }
+            dict: qty_a, qty_b, notional_a, notional_b, margin_a, margin_b
+            None: Min Notional 미달로 진입 불가 시
         """
-        notional = trade_usdt * LEVERAGE   # 레버리지 적용 명목가치
-        qty_a = notional / price_a
-        qty_b = notional / price_b
+        # 변동성 역가중치: 변동성이 큰 코인에 적은 금액 배분
+        vol_sum  = vol_a + vol_b
+        weight_a = vol_b / vol_sum   # A의 vol이 작을수록 A에 더 많이
+        weight_b = vol_a / vol_sum
+
+        margin_a = total_margin_usdt * weight_a
+        margin_b = total_margin_usdt * weight_b
+
+        notional_a = margin_a * LEVERAGE
+        notional_b = margin_b * LEVERAGE
+
+        # Min Notional 방어 — 바이낸스 최소 주문 금액 미달 시 진입 차단
+        if notional_a < MIN_NOTIONAL_USDT or notional_b < MIN_NOTIONAL_USDT:
+            logger.warning(
+                f"Min Notional 미달: notional_A={notional_a:.2f}, "
+                f"notional_B={notional_b:.2f} (최소={MIN_NOTIONAL_USDT})"
+            )
+            return None
+
+        qty_a = notional_a / price_a
+        qty_b = notional_b / price_b
 
         return {
             "qty_a"      : qty_a,
             "qty_b"      : qty_b,
-            "notional_a" : qty_a * price_a,
-            "notional_b" : qty_b * price_b,
-            "margin_each": trade_usdt,
+            "notional_a" : notional_a,
+            "notional_b" : notional_b,
+            "margin_a"   : margin_a,
+            "margin_b"   : margin_b,
         }
 
     # ── 포지션 상태 기록/해제 ─────────────────────────────────────────────────
