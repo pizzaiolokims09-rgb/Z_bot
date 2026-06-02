@@ -496,3 +496,37 @@ class OrderExecutor:
                 else:
                     logger.error(f"[{pair_prefix}] [청산포기] {symbol} — 재시도 횟수 초과")
                     raise
+
+    async def get_active_positions(self) -> dict:
+        """
+        현재 실제로 거래소(또는 페이퍼 계정)에 열려 있는 모든 선물 포지션 정보를 반환합니다.
+        반환 형식: { 'BTC/USDT:USDT': { 'side': 'long'|'short', 'qty': float } }
+        """
+        if IS_PAPER_TRADING:
+            res = {}
+            for sym, pos in self._paper.positions.items():
+                qty = abs(float(pos.get("qty", 0.0)))
+                if qty > 0:
+                    # 'buy' -> 'long', 'sell' -> 'short'로 통일
+                    side = "long" if pos.get("side") == "buy" else "short"
+                    res[sym] = {"side": side, "qty": qty}
+            return res
+
+        try:
+            positions = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._exchange.fetch_positions()
+            )
+            res = {}
+            for pos in positions:
+                contracts = abs(float(pos.get("contracts", 0.0)))
+                if contracts > 0:
+                    symbol = pos.get("symbol")
+                    side = pos.get("side")
+                    if side not in ("long", "short"):
+                        amt = float(pos.get("info", {}).get("positionAmt", 0.0))
+                        side = "long" if amt > 0 else "short"
+                    res[symbol] = {"side": side, "qty": contracts}
+            return res
+        except Exception as e:
+            logger.error(f"[포지션동기화] 실제 포지션 조회 실패: {e}")
+            raise

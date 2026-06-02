@@ -727,6 +727,46 @@ async def main_loop():
         )
         bot_state.initial_balance = live_bal
 
+    # ── 바이낸스 API와의 실시간 교차 검증 (Source of Truth) ──
+    if bot_state.positions:
+        logger.info("[포지션동기화] 로컬 저장 포지션 교차 검증 시작...")
+        try:
+            real_positions = await order_executor.get_active_positions()
+            sync_needed = False
+            for prefix, pos in list(bot_state.positions.items()):
+                sym_a = to_futures_symbol(pos.sym_a)
+                sym_b = to_futures_symbol(pos.sym_b)
+                
+                pos_a = real_positions.get(sym_a)
+                pos_b = real_positions.get(sym_b)
+                
+                is_valid = True
+                if not pos_a or not pos_b:
+                    is_valid = False
+                else:
+                    if pos.side == "SHORT_A_LONG_B":
+                        if pos_a["side"] != "short" or pos_b["side"] != "long":
+                            is_valid = False
+                    elif pos.side == "LONG_A_SHORT_B":
+                        if pos_a["side"] != "long" or pos_b["side"] != "short":
+                            is_valid = False
+                
+                if not is_valid:
+                    logger.warning(
+                        f"[포지션동기화] 불일치 감지 | {prefix} 페어가 실제 거래소 포지션과 일치하지 않아 "
+                        f"JSON 복구 데이터에서 제거합니다. (실제: A={pos_a}, B={pos_b})"
+                    )
+                    bot_state.positions.pop(prefix, None)
+                    sync_needed = True
+            
+            if sync_needed:
+                await save_state(bot_state)
+                logger.info("[포지션동기화] 불일치 포지션 정리 후 bot_state.json 업데이트 완료")
+            else:
+                logger.info("[포지션동기화] 모든 복구 포지션이 거래소 상태와 일치합니다.")
+        except Exception as e:
+            logger.error(f"[포지션동기화] 교차 검증 중 오류 발생: {e}")
+
     # API 연결 성공 확인 + 잔고 재출력
     confirmed_bal = await order_executor.get_free_balance()
     logger.info("=" * 60)
