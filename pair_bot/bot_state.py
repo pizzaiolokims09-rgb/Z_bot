@@ -102,10 +102,17 @@ class BotState:
     ) -> Tuple[float, float]:
         """
         수수료가 완전히 차감된 순수익(Net PnL)을 반환합니다.
-        result_a, result_b는 거래소에서 반환한 체결 딕셔너리 (average, fee, qty, maker 등 포함)
+        result_a, result_b는 거래소에서 반환한 체결 딕셔너리 (average, fee, qty, maker, info 등 포함)
         
         반환: (net_pnl_usdt, net_pnl_pct)
         """
+        info_a = result_a.get("info", {})
+        info_b = result_b.get("info", {})
+
+        # Binance API 원본에서 realizedPnl 추출 시도
+        realized_a = info_a.get("realizedPnl")
+        realized_b = info_b.get("realizedPnl")
+
         avg_a = result_a.get("average", 0.0)
         avg_b = result_b.get("average", 0.0)
         
@@ -121,13 +128,17 @@ class BotState:
         if qty_a == 0.0: qty_a = pos.margin_a * leverage / pos.price_a
         if qty_b == 0.0: qty_b = pos.margin_b * leverage / pos.price_b
 
-        # Gross PnL (수수료 전)
-        if pos.side == "LONG_A_SHORT_B":
-            gross = qty_a * (avg_a - pos.price_a) + qty_b * (pos.price_b - avg_b)
-        else:  # SHORT_A_LONG_B
-            gross = qty_a * (pos.price_a - avg_a) + qty_b * (avg_b - pos.price_b)
+        # 1) Gross PnL 산출 (API 원본 값 우선, 없으면 수학 수식 Fallback)
+        if realized_a is not None and realized_b is not None:
+            gross = float(realized_a) + float(realized_b)
+        else:
+            # 실시간 감시 등 가상 청산 시 Fallback (수식 계산)
+            if pos.side == "LONG_A_SHORT_B":
+                gross = qty_a * (avg_a - pos.price_a) + qty_b * (pos.price_b - avg_b)
+            else:  # SHORT_A_LONG_B
+                gross = qty_a * (pos.price_a - avg_a) + qty_b * (avg_b - pos.price_b)
 
-        # 수수료 계산
+        # 2) 수수료 계산
         total_notional = (qty_a * pos.price_a) + (qty_b * pos.price_b)
         entry_fee = total_notional * TAKER_FEE_RATE       # 진입 2회 (시장가)
         
@@ -145,6 +156,7 @@ class BotState:
         exit_fee = fee_a + fee_b
         total_fee = entry_fee + exit_fee
 
+        # 3) 최종 Net PnL 산출
         net_pnl      = gross - total_fee
         total_margin = pos.total_margin
         net_pnl_pct  = (net_pnl / total_margin * 100) if total_margin > 0 else 0.0

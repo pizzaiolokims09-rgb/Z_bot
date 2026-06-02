@@ -399,7 +399,7 @@ class OrderExecutor:
                         fee_cost = 0.0
                         if fetched.get("fee"):
                             fee_cost = fetched["fee"].get("cost", 0.0)
-                        return {"symbol": symbol, "average": avg_price, "fee": fee_cost, "qty": contracts, "side": close_side, "maker": True}
+                        return {"symbol": symbol, "average": avg_price, "fee": fee_cost, "qty": contracts, "side": close_side, "maker": True, "info": fetched.get("info", {})}
                     elif status == "canceled":
                         logger.warning(
                             f"[{pair_prefix}] [지정가] {symbol} 외부 취소됨 → 시장가 Fallback"
@@ -522,7 +522,7 @@ class OrderExecutor:
                     fee_cost = 0.0
                     if fetched.get("fee"):
                         fee_cost = fetched["fee"].get("cost", 0.0)
-                    return {"symbol": symbol, "average": avg_price, "fee": fee_cost, "qty": contracts, "side": close_side, "maker": False}
+                    return {"symbol": symbol, "average": avg_price, "fee": fee_cost, "qty": contracts, "side": close_side, "maker": False, "info": fetched.get("info", {})}
                 except Exception as fe:
                     logger.warning(f"[{pair_prefix}] 청산 주문 확인 실패 (기본값 사용): {fe}")
                     return {"symbol": symbol, "average": 0.0, "fee": 0.0, "qty": contracts, "side": close_side, "maker": False}
