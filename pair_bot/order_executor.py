@@ -245,6 +245,11 @@ class OrderExecutor:
         logger.info(f"[{pair_prefix}] [시장가 청산] reason={reason} | A~{price_a:.4f}, B~{price_b:.4f}")
 
         if IS_PAPER_TRADING:
+            pos_a = self._paper.positions.get(sym_a, {})
+            qty_a = pos_a.get("qty", 0.0)
+            pos_b = self._paper.positions.get(sym_b, {})
+            qty_b = pos_b.get("qty", 0.0)
+            
             pnl_a = self._paper.close_order(sym_a, price_a, pair_prefix)
             pnl_b = self._paper.close_order(sym_b, price_b, pair_prefix)
             total  = pnl_a + pnl_b
@@ -252,12 +257,17 @@ class OrderExecutor:
                 f"[{pair_prefix}] [PAPER] 청산완료 | reason={reason} | "
                 f"총 PnL={total:+.4f} USDT | 잔고={self._paper.balance:.2f} USDT"
             )
-            return
+            return (
+                {"average": price_a, "qty": qty_a, "maker": False},
+                {"average": price_b, "qty": qty_b, "maker": False}
+            )
 
-        await asyncio.gather(
+        results = await asyncio.gather(
             self._close_real_position(sym_a, pair_prefix),
             self._close_real_position(sym_b, pair_prefix),
+            return_exceptions=True
         )
+        return results
 
     async def close_pair_limit(
         self,
@@ -270,7 +280,7 @@ class OrderExecutor:
         두 레그를 지정가(Maker)로 익절 청산합니다.
         pos_side: "LONG_A_SHORT_B" | "SHORT_A_LONG_B"
         
-        MAKER_ORDER_TIMEOUT(60초) 이내 체결되지 않으면
+        MAKER_ORDER_TIMEOUT(60초 -> 이제 5초) 이내 체결되지 않으면
         자동으로 주문 취소 → 시장가(Taker) Fallback 청산.
         
         페이퍼 모드에서는 기존 시장가 시뮬레이션으로 처리.
@@ -281,6 +291,11 @@ class OrderExecutor:
         )
 
         if IS_PAPER_TRADING:
+            pos_a = self._paper.positions.get(sym_a, {})
+            qty_a = pos_a.get("qty", 0.0)
+            pos_b = self._paper.positions.get(sym_b, {})
+            qty_b = pos_b.get("qty", 0.0)
+            
             pnl_a = self._paper.close_order(sym_a, price_a, pair_prefix)
             pnl_b = self._paper.close_order(sym_b, price_b, pair_prefix)
             total  = pnl_a + pnl_b
@@ -288,13 +303,18 @@ class OrderExecutor:
                 f"[{pair_prefix}] [PAPER] 지정가 익절 완료 | "
                 f"총 PnL={total:+.4f} USDT | 잔고={self._paper.balance:.2f} USDT"
             )
-            return
+            return (
+                {"average": price_a, "qty": qty_a, "maker": True},
+                {"average": price_b, "qty": qty_b, "maker": True}
+            )
 
         # 실거래: 두 레그를 병렬로 지정가 청산 시도
-        await asyncio.gather(
+        results = await asyncio.gather(
             self._close_limit_with_fallback(sym_a, pos_side, "A", pair_prefix),
             self._close_limit_with_fallback(sym_b, pos_side, "B", pair_prefix),
+            return_exceptions=True
         )
+        return results
 
     # ── 지정가 청산 + Fallback ────────────────────────────────────────────────
 
@@ -316,7 +336,7 @@ class OrderExecutor:
             contracts = abs(float(pos.get("contracts", 0)))
             if contracts == 0:
                 logger.info(f"[{pair_prefix}] [지정가] {symbol} 보유 없음, 스킵")
-                return
+                return {"symbol": symbol, "average": 0.0, "fee": 0.0, "qty": 0.0, "side": "", "maker": True}
 
             # 방향 결정
             pos_side_raw = pos.get("side")
@@ -343,8 +363,7 @@ class OrderExecutor:
                 logger.warning(
                     f"[{pair_prefix}] [지정가] {symbol} 호가 없음 → 시장가 Fallback"
                 )
-                await self._close_real_position(symbol, pair_prefix)
-                return
+                return await self._close_real_position(symbol, pair_prefix)
 
             # 지정가 주문 (Post-Only로 Maker 보장)
             order = await asyncio.get_running_loop().run_in_executor(
@@ -362,7 +381,7 @@ class OrderExecutor:
 
             # 체결 대기 (MAKER_ORDER_TIMEOUT초)
             elapsed = 0
-            check_interval = 5  # 5초마다 체결 확인
+            check_interval = 1  # 5초에서 1초로 단축! (Fallback 5초 대응)
             while elapsed < MAKER_ORDER_TIMEOUT:
                 await asyncio.sleep(check_interval)
                 elapsed += check_interval
@@ -376,7 +395,11 @@ class OrderExecutor:
                             f"[{pair_prefix}] [지정가 체결] {symbol} 완료! "
                             f"(Maker 수수료 적용, {elapsed}초 소요)"
                         )
-                        return
+                        avg_price = fetched.get("average") or fetched.get("price") or limit_price
+                        fee_cost = 0.0
+                        if fetched.get("fee"):
+                            fee_cost = fetched["fee"].get("cost", 0.0)
+                        return {"symbol": symbol, "average": avg_price, "fee": fee_cost, "qty": contracts, "side": close_side, "maker": True}
                     elif status == "canceled":
                         logger.warning(
                             f"[{pair_prefix}] [지정가] {symbol} 외부 취소됨 → 시장가 Fallback"
@@ -385,7 +408,7 @@ class OrderExecutor:
                 except Exception as e:
                     logger.debug(f"[{pair_prefix}] 주문 상태 조회 오류: {e}")
 
-            # Fallback: 미체결 → 주문 취소 → 시장가 청산
+            # Fallback: 미체결 → 주문 취소 → 시장가 Fallback
             logger.warning(
                 f"[{pair_prefix}] [지정가 미체결] {symbol} {MAKER_ORDER_TIMEOUT}초 초과 "
                 f"→ 주문 취소 후 시장가 Fallback"
@@ -398,18 +421,19 @@ class OrderExecutor:
                 logger.debug(f"[{pair_prefix}] 주문 취소 중 오류 (이미 체결?): {e}")
 
             # 시장가로 잔여 수량 청산
-            await self._close_real_position(symbol, pair_prefix)
+            return await self._close_real_position(symbol, pair_prefix)
 
         except Exception as e:
             logger.error(
                 f"[{pair_prefix}] [지정가 실패] {symbol}: {e} → 시장가 Fallback"
             )
             try:
-                await self._close_real_position(symbol, pair_prefix)
+                return await self._close_real_position(symbol, pair_prefix)
             except Exception as e2:
                 logger.critical(
                     f"[{pair_prefix}] [Fallback 시장가도 실패!] {symbol}: {e2} — 수동 확인 필요!"
                 )
+                raise e2
 
     # ── 내부 주문 처리 ────────────────────────────────────────────────────────
 
@@ -469,7 +493,7 @@ class OrderExecutor:
                 contracts = abs(float(pos.get("contracts", 0)))
                 if contracts == 0:
                     logger.info(f"[{pair_prefix}] [청산] {symbol} 보유 포지션 없음, 스킵")
-                    return
+                    return {"symbol": symbol, "average": 0.0, "fee": 0.0, "qty": 0.0, "side": "", "maker": False}
                 
                 # CCXT의 contracts는 절대값이므로, side 필드로 방향 판단
                 pos_side = pos.get("side")
@@ -488,7 +512,21 @@ class OrderExecutor:
                     )
                 )
                 logger.info(f"[{pair_prefix}] [실거래] 청산완료 id={order['id']} | {symbol}")
-                return
+                
+                # 정확한 실체결가(average)와 수수료(fee)를 가져오기 위해 fetch_order 호출
+                try:
+                    fetched = await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: self._exchange.fetch_order(order['id'], symbol)
+                    )
+                    avg_price = fetched.get("average") or fetched.get("price") or 0.0
+                    fee_cost = 0.0
+                    if fetched.get("fee"):
+                        fee_cost = fetched["fee"].get("cost", 0.0)
+                    return {"symbol": symbol, "average": avg_price, "fee": fee_cost, "qty": contracts, "side": close_side, "maker": False}
+                except Exception as fe:
+                    logger.warning(f"[{pair_prefix}] 청산 주문 확인 실패 (기본값 사용): {fe}")
+                    return {"symbol": symbol, "average": 0.0, "fee": 0.0, "qty": contracts, "side": close_side, "maker": False}
+
             except Exception as e:
                 logger.warning(f"[{pair_prefix}] [청산실패 {attempt}/{ORDER_RETRY_COUNT}] {symbol}: {e}")
                 if attempt < ORDER_RETRY_COUNT:

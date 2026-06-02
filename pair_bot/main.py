@@ -131,52 +131,60 @@ async def _execute_close(
     dev: float,
     z_score: float = 0.0,      # 청산 시점 Z-Score (CSV 로깅용)
 ):
-    """청산 주문 → Net PnL 계산(수수료 차감) → 상태 정리 → 텔레그램 알림 → CSV 기록 → 상태 저장."""
+    """청산 주문 → Net PnL 계산(실체결가 기반) → 상태 정리 → 텔레그램 알림 → CSV 기록 → 상태 저장."""
     pos = bot_state.positions.get(prefix)
     is_maker = (reason == "TAKE_PROFIT")
 
-    # Net PnL 계산 — 익절 시 Maker, 그 외 Taker 수수료 차감
-    pnl_usdt, pnl_pct = 0.0, 0.0
-    if pos:
-        pnl_usdt, pnl_pct = bot_state.calc_pnl(
-            pos, price_a, price_b, LEVERAGE, is_maker_exit=is_maker
-        )
-        bot_state.record_trade(pnl_usdt)
-        bot_state.positions.pop(prefix, None)
-
-    fee_tag = "Maker" if is_maker else "Taker"
-    if reason == "STOP_LOSS":
-        logger.warning(
-            f"[{prefix}] 손절 발동 | dev={dev:+.3f}% | "
-            f"Net PnL={pnl_usdt:+.4f} USDT ({pnl_pct:+.3f}%) [{fee_tag} 수수료]"
-        )
-    elif reason == "MANUAL":
-        logger.info(
-            f"[{prefix}] 수동 청산 | Net PnL={pnl_usdt:+.4f} USDT ({pnl_pct:+.3f}%) [{fee_tag} 수수료]"
-        )
-    elif reason == "KILL_SWITCH":
-        logger.critical(
-            f"[{prefix}] 킬스위치 청산 | Net PnL={pnl_usdt:+.4f} USDT [{fee_tag} 수수료]"
-        )
-    else:
-        logger.info(
-            f"[{prefix}] 익절 | 괴리 회귀 | dev={dev:+.3f}% | "
-            f"Net PnL={pnl_usdt:+.4f} USDT ({pnl_pct:+.3f}%) [{fee_tag} 수수료]"
-        )
-
     # 익절 시 지정가(Maker), 그 외 시장가(Taker) 청산
+    results = None
     if is_maker and pos:
-        await order_executor.close_pair_limit(
+        results = await order_executor.close_pair_limit(
             sym_a=sym_a, price_a=price_a,
             sym_b=sym_b, price_b=price_b,
             pos_side=pos.side, pair_prefix=prefix,
         )
     else:
-        await order_executor.close_pair(
+        results = await order_executor.close_pair(
             sym_a=sym_a, price_a=price_a,
             sym_b=sym_b, price_b=price_b,
             reason=reason, pair_prefix=prefix,
         )
+
+    # 실체결 결과를 바탕으로 Net PnL 계산
+    pnl_usdt, pnl_pct = 0.0, 0.0
+    if pos:
+        # results는 (result_a, result_b) 형태
+        if results and not isinstance(results[0], Exception) and not isinstance(results[1], Exception):
+            res_a, res_b = results
+        else:
+            # 에러난 경우 fallback 추산
+            logger.warning(f"[{prefix}] 청산 결과 비정상 - 요청 호가로 PnL 임시 추산")
+            res_a = {"average": price_a, "qty": (pos.margin_a * LEVERAGE)/pos.price_a, "maker": is_maker}
+            res_b = {"average": price_b, "qty": (pos.margin_b * LEVERAGE)/pos.price_b, "maker": is_maker}
+
+        pnl_usdt, pnl_pct = bot_state.calc_pnl(pos, res_a, res_b)
+        bot_state.record_trade(pnl_usdt)
+        bot_state.positions.pop(prefix, None)
+
+    if reason == "STOP_LOSS":
+        logger.warning(
+            f"[{prefix}] 손절 발동 | dev={dev:+.3f}% | "
+            f"Net PnL={pnl_usdt:+.4f} USDT ({pnl_pct:+.3f}%) [실체결가 기준]"
+        )
+    elif reason == "MANUAL":
+        logger.info(
+            f"[{prefix}] 수동 청산 | Net PnL={pnl_usdt:+.4f} USDT ({pnl_pct:+.3f}%) [실체결가 기준]"
+        )
+    elif reason == "KILL_SWITCH":
+        logger.critical(
+            f"[{prefix}] 킬스위치 청산 | Net PnL={pnl_usdt:+.4f} USDT [실체결가 기준]"
+        )
+    else:
+        logger.info(
+            f"[{prefix}] 익절 | 괴리 회귀 | dev={dev:+.3f}% | "
+            f"Net PnL={pnl_usdt:+.4f} USDT ({pnl_pct:+.3f}%) [실체결가 기준]"
+        )
+
     risk_manager.close_position(prefix)
     await notifier.send_exit(prefix, pnl_usdt, pnl_pct, reason)
 

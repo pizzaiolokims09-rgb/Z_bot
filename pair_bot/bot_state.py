@@ -97,35 +97,52 @@ class BotState:
     def calc_pnl(
         self,
         pos: PairPosition,
-        price_a: float,
-        price_b: float,
-        leverage: int,
-        is_maker_exit: bool = False,
+        result_a: dict,
+        result_b: dict,
     ) -> Tuple[float, float]:
         """
         수수료가 완전히 차감된 순수익(Net PnL)을 반환합니다.
-        변동성 가중치 비대칭 증거금(margin_a, margin_b) 기반 계산.
+        result_a, result_b는 거래소에서 반환한 체결 딕셔너리 (average, fee, qty, maker 등 포함)
         
         반환: (net_pnl_usdt, net_pnl_pct)
         """
-        notional_a = pos.margin_a * leverage
-        notional_b = pos.margin_b * leverage
-        qty_a = notional_a / pos.price_a
-        qty_b = notional_b / pos.price_b
+        avg_a = result_a.get("average", 0.0)
+        avg_b = result_b.get("average", 0.0)
+        
+        # 방어 로직: 체결가가 0이면 진입가로 대체 (오류 방지)
+        if avg_a == 0.0: avg_a = pos.price_a
+        if avg_b == 0.0: avg_b = pos.price_b
+        
+        qty_a = result_a.get("qty", 0.0)
+        qty_b = result_b.get("qty", 0.0)
+        
+        # 방어 로직: 수량이 0이면 기존 계산식으로 대체
+        leverage = 5  # config.LEVERAGE이지만 기본값 5로 폴백하거나 추산 (호출처에서 넘기지 않으므로 고정 또는 pos에서 역산 가능)
+        if qty_a == 0.0: qty_a = pos.margin_a * leverage / pos.price_a
+        if qty_b == 0.0: qty_b = pos.margin_b * leverage / pos.price_b
 
         # Gross PnL (수수료 전)
         if pos.side == "LONG_A_SHORT_B":
-            gross = qty_a * (price_a - pos.price_a) + qty_b * (pos.price_b - price_b)
+            gross = qty_a * (avg_a - pos.price_a) + qty_b * (pos.price_b - avg_b)
         else:  # SHORT_A_LONG_B
-            gross = qty_a * (pos.price_a - price_a) + qty_b * (price_b - pos.price_b)
+            gross = qty_a * (pos.price_a - avg_a) + qty_b * (avg_b - pos.price_b)
 
         # 수수료 계산
-        total_notional = notional_a + notional_b
+        total_notional = (qty_a * pos.price_a) + (qty_b * pos.price_b)
         entry_fee = total_notional * TAKER_FEE_RATE       # 진입 2회 (시장가)
-        if is_maker_exit:
-            exit_fee = total_notional * MAKER_FEE_RATE     # 청산 2회 (지정가 Maker)
-        else:
-            exit_fee = total_notional * TAKER_FEE_RATE     # 청산 2회 (시장가 Taker)
+        
+        # 청산 수수료는 API 리턴값(fee) 우선 사용, 없으면 설정된 TAKER/MAKER rate로 추산
+        fee_a = result_a.get("fee", 0.0)
+        if fee_a == 0.0:
+            rate_a = MAKER_FEE_RATE if result_a.get("maker") else TAKER_FEE_RATE
+            fee_a = (qty_a * avg_a) * rate_a
+            
+        fee_b = result_b.get("fee", 0.0)
+        if fee_b == 0.0:
+            rate_b = MAKER_FEE_RATE if result_b.get("maker") else TAKER_FEE_RATE
+            fee_b = (qty_b * avg_b) * rate_b
+            
+        exit_fee = fee_a + fee_b
         total_fee = entry_fee + exit_fee
 
         net_pnl      = gross - total_fee
