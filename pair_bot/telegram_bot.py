@@ -26,8 +26,9 @@ from telegram.ext import (
 )
 from telegram.error import TelegramError
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, STOP_LOSS_COOLDOWN_SEC
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, STOP_LOSS_COOLDOWN_SEC, SECTORS
 from bot_state import BotState
+from pair_scanner import PairScanner
 
 if TYPE_CHECKING:
     from order_executor import OrderExecutor
@@ -55,6 +56,7 @@ class TelegramNotifier:
     BTN_RESUME  = "▶️ 봇 재시작"
     BTN_STATUS  = "📊 상태 확인"
     BTN_STATS   = "💰 승률 & PnL"
+    BTN_SCAN    = "🔍 페어 스캔"
 
     def _reply_keyboard(self) -> ReplyKeyboardMarkup:
         """항상 입력창 위에 고정되는 하단 키보드를 반환합니다."""
@@ -63,6 +65,7 @@ class TelegramNotifier:
                 [KeyboardButton(self.BTN_CLOSE)],
                 [KeyboardButton(self.BTN_STOP), KeyboardButton(self.BTN_RESUME)],
                 [KeyboardButton(self.BTN_STATUS), KeyboardButton(self.BTN_STATS)],
+                [KeyboardButton(self.BTN_SCAN)],
             ],
             resize_keyboard=True,
             one_time_keyboard=False,
@@ -261,6 +264,30 @@ class TelegramNotifier:
                 reply_markup=self._reply_keyboard(),
             )
 
+        elif text == self.BTN_SCAN:
+            # 스캔 중복 방지
+            if self._state.scan_in_progress:
+                await update.message.reply_text(
+                    "⏳ 이미 스캔이 진행 중입니다. 완료를 기다려 주세요.",
+                    reply_markup=self._reply_keyboard(),
+                )
+                return
+            # 섹터 선택 인라인 키보드
+            buttons = []
+            sector_names = list(SECTORS.keys())
+            for i in range(0, len(sector_names), 2):
+                row = [InlineKeyboardButton(
+                    f"🎨 {s} ({len(SECTORS[s])})",
+                    callback_data=f"scan_sector:{s}"
+                ) for s in sector_names[i:i+2]]
+                buttons.append(row)
+            buttons.append([InlineKeyboardButton("❌ 취소", callback_data="scan_cancel")])
+            await update.message.reply_text(
+                "🔍 스캔할 섹터를 선택하세요:\n"
+                "(선택한 섹터 내의 코인 조합만 검증합니다)",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+
         elif text == self.BTN_STATS:
             s     = self._state
             emoji = "📈" if s.cumulative_pnl >= 0 else "📉"
@@ -336,6 +363,75 @@ class TelegramNotifier:
 
         elif data == "back_to_menu":
             await self._back_to_menu(query)
+
+        # ── 스캔/교체 콜백 핸들러 ─────────────────────────────────────────────
+        elif data.startswith("scan_sector:"):
+            sector = data.split(":", 1)[1]
+            coins = SECTORS.get(sector, [])
+            combos = len(coins) * (len(coins) - 1) // 2
+            await query.edit_message_text(
+                f"🔍 [{sector}] 섹터 스캔\n"
+                f"코인: {', '.join(coins)}\n"
+                f"검증할 조합: {combos}개\n\n"
+                f"스캔을 시작할까요? (약 {len(coins) * 0.5:.0f}초 소요)",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ 스캔 시작", callback_data=f"scan_confirm:{sector}"),
+                     InlineKeyboardButton("❌ 취소", callback_data="scan_cancel")]
+                ]),
+            )
+
+        elif data.startswith("scan_confirm:"):
+            sector = data.split(":", 1)[1]
+            if self._state.scan_in_progress:
+                await query.edit_message_text("⏳ 이미 스캔이 진행 중입니다.")
+                return
+            self._state.scan_in_progress = True
+            await query.edit_message_text(
+                f"⏳ [{sector}] 섹터 스캔 중...\n"
+                f"매매 루프는 정상 작동 중입니다."
+            )
+            # 백그라운드 스캔 실행 (논블로킹)
+            import asyncio
+            asyncio.create_task(
+                self._run_scan_and_report(query, context, sector)
+            )
+
+        elif data == "scan_cancel":
+            await query.edit_message_text("❌ 스캔이 취소되었습니다.")
+
+        elif data.startswith("swap_target:"):
+            # swap_target:old_prefix:new_a:new_b
+            parts = data.split(":", 3)
+            if len(parts) != 4:
+                await query.edit_message_text("❌ 잘못된 데이터입니다.")
+                return
+            _, old_prefix, new_a, new_b = parts
+            new_prefix = f"{new_a.split('/')[0]}-{new_b.split('/')[0]}"
+            has_position = old_prefix in self._state.positions
+            status = "⏳ 포지션 종료 시 자동 교체" if has_position else "⚡ 즉시 교체"
+
+            await query.edit_message_text(
+                f"🔄 페어 교체 확인\n\n"
+                f"교체 대상: [{old_prefix}]\n"
+                f"새 페어: [{new_prefix}]\n"
+                f"상태: {status}\n\n"
+                f"교체를 승인하시겠습니까?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ 교체 승인", callback_data=f"swap_confirm:{old_prefix}:{new_a}:{new_b}"),
+                     InlineKeyboardButton("❌ 거절", callback_data="swap_cancel")]
+                ]),
+            )
+
+        elif data.startswith("swap_confirm:"):
+            parts = data.split(":", 3)
+            if len(parts) != 4:
+                await query.edit_message_text("❌ 잘못된 데이터입니다.")
+                return
+            _, old_prefix, new_a, new_b = parts
+            await self._execute_swap(query, old_prefix, new_a, new_b)
+
+        elif data == "swap_cancel":
+            await query.edit_message_text("❌ 교체가 거절되었습니다.")
 
     # ── 수동 청산 서브 핸들러 ─────────────────────────────────────────────────
 
@@ -447,6 +543,115 @@ class TelegramNotifier:
             f"🤖 페어 트레이딩 봇 컨트롤 패널\n현재 상태: {status}",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
+
+    # ── 스캔 / 교체 헬퍼 메서드 ────────────────────────────────────────────────
+
+    async def _run_scan_and_report(self, query, context, sector: str) -> None:
+        """백그라운드에서 스캔을 실행하고 결과를 텔레그램으로 보고합니다."""
+        try:
+            # exchange 객체 가져오기 (order_executor 내부 또는 별도 public exchange 사용)
+            import ccxt.async_support as ccxt_async
+            scan_exchange = ccxt_async.binanceusdm({
+                "options": {"defaultType": "future", "adjustForTimeDifference": True},
+                "enableRateLimit": True,
+            })
+
+            scanner = PairScanner()
+            results = await scanner.scan_sector(sector, scan_exchange)
+
+            await scan_exchange.close()
+        except Exception as e:
+            logger.error(f"[스캐너] 스캔 중 오류: {e}")
+            self._state.scan_in_progress = False
+            await self._send(f"❌ [{sector}] 스캔 실패: {e}")
+            return
+        finally:
+            self._state.scan_in_progress = False
+
+        if not results:
+            await self._send(
+                f"🔍 [{sector}] 스캔 완료\n"
+                f"유효한 페어를 찾지 못했습니다.\n"
+                f"(상관계수 >= 0.7 AND ADF p-value <= 0.05 조건 미충족)"
+            )
+            return
+
+        # 상위 3개 결과 표시
+        lines = [f"🔍 [{sector}] 스캔 결과 (상위 {min(3, len(results))}개)\n"]
+        for i, r in enumerate(results[:3], 1):
+            lines.append(
+                f"{i}. {r['pair']} | corr={r['corr']:.3f} | "
+                f"ADF p={r['adf_pvalue']:.4f} | N={r['data_points']}"
+            )
+
+        # 최적 페어에 대해 교체 대상 선택 UI
+        best = results[0]
+        lines.append(f"\n추천 페어: {best['pair']} (score={best['score']:.4f})")
+        lines.append("\n어떤 기존 페어와 교체할까요?")
+
+        from config import PAIRS_TO_TRADE
+        buttons = []
+        for sym_a, sym_b in PAIRS_TO_TRADE:
+            prefix = f"{sym_a.split('/')[0]}-{sym_b.split('/')[0]}"
+            pos_mark = "📌" if prefix in self._state.positions else "⚪"
+            pending_mark = "⏳" if prefix in self._state.pending_swaps else ""
+            buttons.append([InlineKeyboardButton(
+                f"{pos_mark}{pending_mark} {prefix}",
+                callback_data=f"swap_target:{prefix}:{best['sym_a']}:{best['sym_b']}"
+            )])
+        buttons.append([InlineKeyboardButton("❌ 교체 안 함", callback_data="swap_cancel")])
+
+        await self._send("\n".join(lines))
+        await self._app.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text="교체할 기존 페어를 선택하세요:\n"
+                 "(📌 = 활성 포지션, ⏳ = 교체 예약 중)",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    async def _execute_swap(self, query, old_prefix: str, new_a: str, new_b: str) -> None:
+        """교체 승인 처리: 포지션 있으면 pending_swap, 없으면 즉시 교체."""
+        from config import PAIRS_TO_TRADE
+        from state_persistence import save_state
+
+        new_prefix = f"{new_a.split('/')[0]}-{new_b.split('/')[0]}"
+
+        if old_prefix in self._state.positions:
+            # 활성 포지션 있음 → pending_swaps에 예약
+            self._state.pending_swaps[old_prefix] = (new_a, new_b)
+            await save_state(self._state)
+            logger.info(f"[PendingSwap] 예약 등록: {old_prefix} → {new_prefix}")
+            await query.edit_message_text(
+                f"⏳ 교체 예약 완료!\n\n"
+                f"[{old_prefix}] 포지션이 익절/손절로 종료되면\n"
+                f"자동으로 [{new_prefix}]로 바통 터치됩니다.\n\n"
+                f"기존 포지션은 절대 강제 청산하지 않습니다."
+            )
+        else:
+            # 활성 포지션 없음 → 즉시 교체
+            swapped = False
+            for i, (a, b) in enumerate(PAIRS_TO_TRADE):
+                pf = f"{a.split('/')[0]}-{b.split('/')[0]}"
+                if pf == old_prefix:
+                    PAIRS_TO_TRADE[i] = (new_a, new_b)
+                    swapped = True
+                    break
+            if not swapped:
+                PAIRS_TO_TRADE.append((new_a, new_b))
+
+            await save_state(self._state)
+            logger.info(f"[PendingSwap] 즉시 교체: {old_prefix} → {new_prefix}")
+            await query.edit_message_text(
+                f"🔄 즉시 교체 완료!\n\n"
+                f"[{old_prefix}] → [{new_prefix}]\n"
+                f"새 페어 루프가 자동으로 시작됩니다.\n"
+                f"24시간 과거 데이터 워밍업 진행 중..."
+            )
+
+            # 기존 루프 종료 신호 + 새 루프 시작은 main.py의 swap_executor가 처리
+            # bot_state에 즉시 교체 완료 플래그 등록
+            self._state.pending_swaps[old_prefix] = (new_a, new_b)
+            await save_state(self._state)
 
     # =========================================================================
     # 내부 전송 헬퍼

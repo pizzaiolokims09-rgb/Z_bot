@@ -51,6 +51,15 @@ async def save_state(bot_state: BotState) -> None:
             "entry_z_score": pos.entry_z_score,
         }
 
+    # pending_swaps 직렬화: {prefix: [sym_a, sym_b]}
+    swaps_data = {
+        k: list(v) for k, v in bot_state.pending_swaps.items()
+    }
+
+    # 런타임 페어 리스트 저장 (서버 재시작 시 config.py 대신 이 리스트 사용)
+    from config import PAIRS_TO_TRADE
+    active_pairs = [[a, b] for a, b in PAIRS_TO_TRADE]
+
     data = {
         "positions"     : positions_data,
         "total_trades"  : bot_state.total_trades,
@@ -60,6 +69,8 @@ async def save_state(bot_state: BotState) -> None:
         "cooldowns"     : bot_state.cooldowns,
         "daily_stop_counts": bot_state.daily_stop_counts,
         "daily_reset_date": bot_state.daily_reset_date,
+        "pending_swaps" : swaps_data,
+        "active_pairs"  : active_pairs,
         "saved_at"      : _dt_to_str(datetime.now(KST)),
     }
 
@@ -98,6 +109,25 @@ async def load_state(bot_state: BotState) -> bool:
         bot_state.cooldowns = data.get("cooldowns", {})
         bot_state.daily_stop_counts = data.get("daily_stop_counts", {})
         bot_state.daily_reset_date = data.get("daily_reset_date", "")
+
+        # pending_swaps 복구: {prefix: (sym_a, sym_b)}
+        raw_swaps = data.get("pending_swaps", {})
+        for k, v in raw_swaps.items():
+            if isinstance(v, list) and len(v) == 2:
+                bot_state.pending_swaps[k] = tuple(v)
+        if bot_state.pending_swaps:
+            logger.info(f"[StateStore] pending_swaps 복구: {bot_state.pending_swaps}")
+
+        # 런타임 페어 리스트 복구 (config.py 하드코딩 리스트를 덮어씀)
+        saved_pairs = data.get("active_pairs")
+        if saved_pairs and isinstance(saved_pairs, list) and len(saved_pairs) > 0:
+            bot_state.active_pairs_override = [
+                tuple(p) for p in saved_pairs if isinstance(p, list) and len(p) == 2
+            ]
+            logger.info(
+                f"[StateStore] 저장된 페어 리스트 복구 | "
+                f"{len(bot_state.active_pairs_override)}개 페어"
+            )
 
         # 포지션 복구
         positions_data = data.get("positions", {})

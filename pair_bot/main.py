@@ -79,6 +79,16 @@ def make_prefix(sym_a: str, sym_b: str) -> str:
     return f"{sym_a.split('/')[0]}-{sym_b.split('/')[0]}"
 
 
+def _swap_pair_in_list(old_prefix: str, new_sym_a: str, new_sym_b: str) -> bool:
+    """PAIRS_TO_TRADE 리스트에서 old_prefix에 해당하는 페어를 찾아 새 페어로 교체."""
+    for i, (a, b) in enumerate(PAIRS_TO_TRADE):
+        if make_prefix(a, b) == old_prefix:
+            PAIRS_TO_TRADE[i] = (new_sym_a, new_sym_b)
+            return True
+    PAIRS_TO_TRADE.append((new_sym_a, new_sym_b))
+    return False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 가격 조회 (ccxt async — 공개 REST, 키 불필요)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -412,6 +422,18 @@ async def pair_loop(
                         sym_a, sym_b, risk_manager, order_executor,
                         bot_state, notifier, logger, 0.0,
                     )
+                    # 청산 직후 pending_swap 바통 터치
+                    if prefix in bot_state.pending_swaps:
+                        new_a, new_b = bot_state.pending_swaps.pop(prefix)
+                        new_prefix = make_prefix(new_a, new_b)
+                        _swap_pair_in_list(prefix, new_a, new_b)
+                        await save_state(bot_state)
+                        await notifier._send(f"🔄 [{prefix}] → [{new_prefix}] 바통 터치! 새 페어 워밍업 시작")
+                        asyncio.create_task(
+                            pair_loop(new_a, new_b, exchange, order_executor, bot_state, notifier, entry_lock)
+                        )
+                        logger.info(f"[PendingSwap] {prefix} → {new_prefix} 교체 완료, 이 루프 종료")
+                        return
                 await asyncio.sleep(POLL_INTERVAL_SEC)
                 continue
 
@@ -661,8 +683,20 @@ async def pair_loop(
                                 )
                                 bot_state.cooldowns[prefix] = time.time()
                                 bot_state.daily_stop_counts[prefix] = bot_state.daily_stop_counts.get(prefix, 0) + 1
-                                await save_state(bot_state)  # 쿨다운 및 손절 횟수 상태 파일에 영구 기록
+                                await save_state(bot_state)
                                 entry_timestamp = 0.0
+                                # 청산 직후 pending_swap 바통 터치
+                                if prefix in bot_state.pending_swaps:
+                                    new_a, new_b = bot_state.pending_swaps.pop(prefix)
+                                    new_prefix = make_prefix(new_a, new_b)
+                                    _swap_pair_in_list(prefix, new_a, new_b)
+                                    await save_state(bot_state)
+                                    await notifier._send(f"🔄 [{prefix}] → [{new_prefix}] 바통 터치! 새 페어 워밍업 시작")
+                                    asyncio.create_task(
+                                        pair_loop(new_a, new_b, exchange, order_executor, bot_state, notifier, entry_lock)
+                                    )
+                                    logger.info(f"[PendingSwap] {prefix} → {new_prefix} 교체 완료, 이 루프 종료")
+                                    return
                                 await asyncio.sleep(POLL_INTERVAL_SEC)
                                 continue
 
@@ -688,8 +722,20 @@ async def pair_loop(
                     )
                     bot_state.cooldowns[prefix] = time.time()  # 쿨다운 타이머 시작
                     bot_state.daily_stop_counts[prefix] = bot_state.daily_stop_counts.get(prefix, 0) + 1  # 일일 손절 카운터 증가
-                    await save_state(bot_state)  # 쿨다운 및 손절 횟수 상태 파일에 영구 기록
+                    await save_state(bot_state)
                     entry_timestamp = 0.0
+                    # 청산 직후 pending_swap 바통 터치
+                    if prefix in bot_state.pending_swaps:
+                        new_a, new_b = bot_state.pending_swaps.pop(prefix)
+                        new_prefix = make_prefix(new_a, new_b)
+                        _swap_pair_in_list(prefix, new_a, new_b)
+                        await save_state(bot_state)
+                        await notifier._send(f"🔄 [{prefix}] → [{new_prefix}] 바통 터치! 새 페어 워밍업 시작")
+                        asyncio.create_task(
+                            pair_loop(new_a, new_b, exchange, order_executor, bot_state, notifier, entry_lock)
+                        )
+                        logger.info(f"[PendingSwap] {prefix} → {new_prefix} 교체 완료, 이 루프 종료")
+                        return
 
                 elif signal == "EXIT":
                     # 익절 안전장치: Maker 수수료 기준 Net PnL 0 초과 시에만 청산
@@ -712,6 +758,18 @@ async def pair_loop(
                         z_score=state["z_score"],
                     )
                     entry_timestamp = 0.0
+                    # 청산 직후 pending_swap 바통 터치
+                    if prefix in bot_state.pending_swaps:
+                        new_a, new_b = bot_state.pending_swaps.pop(prefix)
+                        new_prefix = make_prefix(new_a, new_b)
+                        _swap_pair_in_list(prefix, new_a, new_b)
+                        await save_state(bot_state)
+                        await notifier._send(f"🔄 [{prefix}] → [{new_prefix}] 바통 터치! 새 페어 워밍업 시작")
+                        asyncio.create_task(
+                            pair_loop(new_a, new_b, exchange, order_executor, bot_state, notifier, entry_lock)
+                        )
+                        logger.info(f"[PendingSwap] {prefix} → {new_prefix} 교체 완료, 이 루프 종료")
+                        return
 
             # ── 5. 킬 스위치 검사 (30초마다) ────────────────────────────────────
             if int(time.time()) % 30 == 0:
@@ -775,6 +833,19 @@ async def main_loop():
             f"(저장값={bot_state.initial_balance:.2f} USDT)"
         )
         bot_state.initial_balance = live_bal
+
+        # ── 저장된 페어 리스트로 PAIRS_TO_TRADE 덮어쓰기 (기억 상실 방지) ──
+        if bot_state.active_pairs_override:
+            PAIRS_TO_TRADE.clear()
+            PAIRS_TO_TRADE.extend(bot_state.active_pairs_override)
+            logger.info(
+                f"[PairOverride] bot_state.json의 페어 리스트로 교체 완료 | "
+                f"{len(PAIRS_TO_TRADE)}개 페어"
+            )
+            for sym_a, sym_b in PAIRS_TO_TRADE:
+                logger.info(f"    [{make_prefix(sym_a, sym_b):12s}]  {sym_a}  /  {sym_b}")
+        else:
+            logger.info("[PairOverride] 저장된 페어 리스트 없음 → config.py 기본값 유지")
 
     # ── 바이낸스 API와의 실시간 교차 검증 (Source of Truth) ──
     if bot_state.positions:

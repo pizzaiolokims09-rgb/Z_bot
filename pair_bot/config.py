@@ -50,8 +50,8 @@ PAIRS_TO_TRADE = [
     ("RENDER/USDT",   "FET/USDT"),         # AI 섹터
     ("WLD/USDT",      "ARKM/USDT"),        # 샘 알트먼 & AI 테마
     # ("JUP/USDT",      "RAY/USDT"),         # 솔라나 DEX 테마 (Testnet 미지원, 실계좌 전환 시 주석 해제)
-    ("DOGE/USDT",     "1000SHIB/USDT"),    # 밈 대형 (Top 15)
-    ("1000PEPE/USDT", "1000BONK/USDT"),    # 밈 대형 (Top 30)
+    # ("DOGE/USDT",     "1000SHIB/USDT"),    # 밈 대형 (Top 15)
+    # ("1000PEPE/USDT", "1000BONK/USDT"),    # 밈 대형 (Top 30)
 ]
 
 # ── 레버리지 ────────────────────────────────────────────────────────────────
@@ -159,3 +159,25 @@ WARMUP_BATCH_SIZE = 5
 # Z-Score가 진입 문턱을 넘은 후, 이 시간(초) 동안 계속 유지될 때만 진입
 # 휩쏘(1분 내 급등락 후 복귀)로 인한 허위 진입을 방지
 ENTRY_CONFIRMATION_SEC = 30   # 30초 확인 매매
+
+# ── 섹터 제한형 스캐너 설정 ──────────────────────────────────────────────────
+# 스캐너가 작동할 때, 전체 시장이 아닌 선택된 섹터 안에서만 페어 조합을 검증
+SECTORS = {
+    "L1_Major":  ["BTC", "ETH", "SOL", "AVAX"],
+    "L1_NewGen": ["APT", "SUI", "SEI", "INJ"],
+    "L1_Infra":  ["ADA", "TRX", "POL", "NEAR", "HBAR", "ALGO"],
+    "L2":        ["ARB", "OP"],
+    "DeFi":      ["UNI", "AAVE", "LINK", "DOT"],
+    "AI":        ["RENDER", "FET", "WLD", "ARKM"],
+    "Storage":   ["FIL", "AR"],
+    "BTC_Eco":   ["STX", "ORDI"],
+    "Payment":   ["XRP", "XLM", "LTC", "BCH"],
+    "Meme":      ["DOGE", "1000SHIB", "1000PEPE", "1000BONK"],
+}
+
+# 스캔 파라미터
+SCAN_CORR_THRESHOLD = 0.7      # 상관계수 최소값
+SCAN_ADF_PVALUE     = 0.05     # ADF 검정 p-value 최대값 (공적분 유의수준)
+SCAN_DATA_HOURS     = 336      # 스캔 데이터 기간 (14일 x 24h = 336개 1h봉, 표본 N>=300 확보)
+SCAN_TIMEFRAME      = "1h"     # 스캔용 캔들 타임프레임
+SCAN_FETCH_DELAY    = 0.3      # 코인별 fetch_ohlcv 호출 간 딜레이 (초, Rate Limit 방어)
