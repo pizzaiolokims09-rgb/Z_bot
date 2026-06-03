@@ -734,7 +734,9 @@ async def pair_loop(
                 if pos and signal not in ("STOP", "EXIT"):
                     try:
                         # 거래소에서 두 레그의 미실현 PnL 직접 조회 (ccxt.async_support 사용 중이므로 직접 await)
-                        positions_raw = await exchange.fetch_positions([sym_a, sym_b])
+                        # 인자에 [sym_a, sym_b]를 주면 ccxt 내부의 엄격한 심볼 필터링(:USDT 불일치)으로 인해 빈 리스트가 반환됨.
+                        # 따라서 전체 포지션을 가져와서 아래 루프에서 base_sym으로 직접 매칭함.
+                        positions_raw = await exchange.fetch_positions()
                         upnl_a = 0.0
                         upnl_b = 0.0
                         for p in positions_raw:
