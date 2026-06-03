@@ -10,6 +10,7 @@ import logging
 import math
 import sys
 import time
+from collections import deque
 from datetime import date, datetime
 from logging.handlers import RotatingFileHandler
 
@@ -27,6 +28,7 @@ from config import (
     WARMUP_BATCH_SIZE, EXIT_Z_SCORE, TARGET_NET_PNL_PCT,
     TAKER_FEE_RATE, MAKER_FEE_RATE,
     ENTRY_CONFIRMATION_SEC, MAX_LOSS_PCT,
+    CORR_WINDOW_MIN, CORR_STOP_THRESHOLD, STOP_LOSS_Z_SCORE,
 )
 from spread_engine      import SpreadEngine
 from risk_manager       import RiskManager
@@ -385,6 +387,37 @@ async def prefetch_warmup_data(exchange: ccxt_async.Exchange, sym_a: str, sym_b:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 피어슨 상관계수 헬퍼 (스마트 손절용)
+# ─────────────────────────────────────────────────────────────────────────────
+def calc_pearson_corr(prices_a: deque, prices_b: deque) -> float:
+    """
+    두 가격 시계열의 피어슨 상관계수를 수동 계산합니다.
+    데이터가 부족하면(20개 미만) 1.0을 반환하여 손절을 방지합니다.
+    """
+    n = min(len(prices_a), len(prices_b))
+    if n < 20:  # 최소 20분치 데이터가 있어야 유의미한 상관계수
+        return 1.0
+
+    a_list = list(prices_a)[-n:]
+    b_list = list(prices_b)[-n:]
+
+    sum_a = sum(a_list)
+    sum_b = sum(b_list)
+    sum_ab = sum(a * b for a, b in zip(a_list, b_list))
+    sum_a2 = sum(a * a for a in a_list)
+    sum_b2 = sum(b * b for b in b_list)
+
+    numerator = n * sum_ab - sum_a * sum_b
+    denom_a = n * sum_a2 - sum_a ** 2
+    denom_b = n * sum_b2 - sum_b ** 2
+
+    if denom_a <= 0 or denom_b <= 0:
+        return 1.0  # 분산이 0이면 상관계수 계산 불가 → 안전 반환
+
+    return numerator / (denom_a ** 0.5 * denom_b ** 0.5)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 단일 페어 감시 루프 (Z-Score / 진입 / 청산 핵심 로직 유지)
 # ─────────────────────────────────────────────────────────────────────────────
 async def pair_loop(
@@ -411,6 +444,11 @@ async def pair_loop(
     entry_timestamp = 0.0      # 포지션 진입 시각 (time.time() 기반, 시간 기반 청산용)
     entry_confirm_ts = 0.0     # 30초 확인 매매: Z-Score가 문턴을 처음 넘은 시각
     reconnect_wait = 5
+
+    # ── 스마트 손절용: 1분봉 종가 히스토리 (피어슨 상관계수 계산) ──
+    corr_prices_a: deque = deque(maxlen=CORR_WINDOW_MIN)  # 최근 60분 A코인 종가
+    corr_prices_b: deque = deque(maxlen=CORR_WINDOW_MIN)  # 최근 60분 B코인 종가
+    corr_sample_counter = 0  # 10초 폴링을 1분 단위로 다운샘플링하기 위한 카운터
 
     # ── 봇 상태(bot_state)에서 기존 포지션 복구 ──
     if prefix in bot_state.positions:
@@ -478,6 +516,13 @@ async def pair_loop(
 
             # 공유 상태 업데이트 (텔레그램 Status 명령에서 사용)
             bot_state.latest_price[prefix] = (price_a, price_b)
+
+            # ── 스마트 손절용: 1분 단위 가격 샘플링 (10초 폴링 x 6 = 1분) ──
+            corr_sample_counter += 1
+            if corr_sample_counter >= 6:
+                corr_sample_counter = 0
+                corr_prices_a.append(price_a)
+                corr_prices_b.append(price_b)
 
             # ── 2. 스프레드 계산 (이동평균 / Z-Score 핵심 로직 유지) ─────────
             state  = spread_engine.update(price_a, price_b)
@@ -728,14 +773,16 @@ async def pair_loop(
                                 await asyncio.sleep(POLL_INTERVAL_SEC)
                                 continue
 
-                # ── Net PnL % 기반 하이브리드 익절 (Z-Score 무관) ──
-                # 거래소 fetch_positions의 unrealizedPnl 사용 (실체결가 기준, 슬리피지 반영)
+                # ══════════════════════════════════════════════════════════
+                # 실시간 청산 감시 — 통합 우선순위 체인
+                # 순서: 익절 → 스마트손절(상관관계) → 하드스탑 → Z-Score손절 → Z-Score익절
+                # ══════════════════════════════════════════════════════════
                 pos = bot_state.positions.get(prefix)
-                if pos and signal not in ("STOP", "EXIT"):
+                if pos:
+                    # ── 공통: 미실현 Net PnL 계산 (거래소 unrealizedPnl 직접 조회) ──
+                    unrealized_pct = 0.0
+                    pnl_calc_ok = False
                     try:
-                        # 거래소에서 두 레그의 미실현 PnL 직접 조회 (ccxt.async_support 사용 중이므로 직접 await)
-                        # 인자에 [sym_a, sym_b]를 주면 ccxt 내부의 엄격한 심볼 필터링(:USDT 불일치)으로 인해 빈 리스트가 반환됨.
-                        # 따라서 전체 포지션을 가져와서 아래 루프에서 base_sym으로 직접 매칭함.
                         positions_raw = await exchange.fetch_positions()
                         upnl_a = 0.0
                         upnl_b = 0.0
@@ -745,172 +792,168 @@ async def pair_loop(
                             if contracts == 0:
                                 continue
                             raw_upnl = float(p.get("unrealizedPnl", 0.0))
-                            
-                            # ccxt는 선물 심볼을 "RENDER/USDT:USDT" 형태로 반환하므로 ":USDT" 등을 제거하고 비교
                             base_sym = sym.split(':')[0]
-                            base_sym_a = sym_a.split(':')[0]
-                            base_sym_b = sym_b.split(':')[0]
-                            
-                            if base_sym == base_sym_a:
+                            if base_sym == sym_a.split(':')[0]:
                                 upnl_a = raw_upnl
-                            elif base_sym == base_sym_b:
+                            elif base_sym == sym_b.split(':')[0]:
                                 upnl_b = raw_upnl
 
-                        # 두 레그 합산 미실현 Gross PnL (거래소 실체결가 기준)
                         gross_pnl = upnl_a + upnl_b
-
-                        # 왕복 수수료 추산 (진입 Taker + 청산 Maker)
                         qty_a = (pos.margin_a * LEVERAGE) / pos.price_a
                         qty_b = (pos.margin_b * LEVERAGE) / pos.price_b
                         entry_notional = (qty_a * pos.price_a) + (qty_b * pos.price_b)
                         exit_notional  = (qty_a * price_a) + (qty_b * price_b)
                         total_fee = (entry_notional * TAKER_FEE_RATE) + (exit_notional * MAKER_FEE_RATE)
-
-                        # 순수익 = Gross PnL - 왕복 수수료
                         unrealized_net = gross_pnl - total_fee
                         total_margin   = pos.margin_a + pos.margin_b
                         unrealized_pct = (unrealized_net / total_margin * 100) if total_margin > 0 else 0.0
+                        pnl_calc_ok = True
+                    except Exception as e:
+                        logger.debug(f"[{prefix}] 미실현PnL 조회 실패 (스킵): {e}")
 
-                        # 양수 순수익이 목표치 이상일 때만 익절 (절대값 금지!)
-                        if unrealized_pct >= TARGET_NET_PNL_PCT:
-                            logger.info(
-                                f"[{prefix}] 목표 순수익 도달! "
-                                f"upnl_A={upnl_a:+.4f} upnl_B={upnl_b:+.4f} "
-                                f"gross={gross_pnl:+.4f} fee={total_fee:.4f} "
-                                f"net={unrealized_net:+.4f} USDT ({unrealized_pct:+.2f}%)"
-                            )
+                    # ── 공통: 상관계수 계산 ──
+                    corr = calc_pearson_corr(corr_prices_a, corr_prices_b)
+
+                    # ── 우선순위 1: 익절 (+3.5%) ──
+                    if pnl_calc_ok and unrealized_pct >= TARGET_NET_PNL_PCT:
+                        logger.info(
+                            f"[{prefix}] 목표 순수익 도달! "
+                            f"upnl_A={upnl_a:+.4f} upnl_B={upnl_b:+.4f} "
+                            f"gross={gross_pnl:+.4f} fee={total_fee:.4f} "
+                            f"net={unrealized_net:+.4f} USDT ({unrealized_pct:+.2f}%)"
+                        )
+                        await _execute_close(
+                            prefix, "TAKE_PROFIT", price_a, price_b,
+                            sym_a, sym_b, risk_manager, order_executor,
+                            bot_state, notifier, logger, dev,
+                            z_score=state["z_score"],
+                            close_reason=f"목표 순수익(+{TARGET_NET_PNL_PCT}%) 도달 익절",
+                        )
+                        entry_timestamp = 0.0
+                        if prefix in bot_state.pending_swaps:
+                            new_a, new_b = bot_state.pending_swaps.pop(prefix)
+                            new_prefix = make_prefix(new_a, new_b)
+                            _swap_pair_in_list(prefix, new_a, new_b)
+                            await save_state(bot_state)
+                            await notifier._send(f"🔄 [{prefix}] → [{new_prefix}] 바통 터치!")
+                            asyncio.create_task(pair_loop(new_a, new_b, exchange, order_executor, bot_state, notifier, entry_lock))
+                            return
+                        await asyncio.sleep(POLL_INTERVAL_SEC)
+                        continue
+
+                    # ── 우선순위 2: 스마트 손절 — 상관관계 붕괴 (corr <= 0) ──
+                    elif corr <= CORR_STOP_THRESHOLD and len(corr_prices_a) >= 20:
+                        logger.warning(
+                            f"[{prefix}] 스마트 손절 발동! 단기 상관계수={corr:.4f} <= {CORR_STOP_THRESHOLD} "
+                            f"(최근 {len(corr_prices_a)}분 데이터)"
+                        )
+                        await _execute_close(
+                            prefix, "STOP_LOSS", price_a, price_b,
+                            sym_a, sym_b, risk_manager, order_executor,
+                            bot_state, notifier, logger, dev,
+                            z_score=state["z_score"],
+                            close_reason=f"단기 상관관계 붕괴(corr={corr:.3f} <= 0) 손절",
+                        )
+                        bot_state.cooldowns[prefix] = time.time()
+                        bot_state.daily_stop_counts[prefix] = bot_state.daily_stop_counts.get(prefix, 0) + 1
+                        await save_state(bot_state)
+                        entry_timestamp = 0.0
+                        if prefix in bot_state.pending_swaps:
+                            new_a, new_b = bot_state.pending_swaps.pop(prefix)
+                            new_prefix = make_prefix(new_a, new_b)
+                            _swap_pair_in_list(prefix, new_a, new_b)
+                            await save_state(bot_state)
+                            await notifier._send(f"🔄 [{prefix}] → [{new_prefix}] 바통 터치!")
+                            asyncio.create_task(pair_loop(new_a, new_b, exchange, order_executor, bot_state, notifier, entry_lock))
+                            return
+                        await asyncio.sleep(POLL_INTERVAL_SEC)
+                        continue
+
+                    # ── 우선순위 3: 하드 스탑 (-3.5%) ──
+                    elif pnl_calc_ok and unrealized_pct <= MAX_LOSS_PCT:
+                        logger.warning(
+                            f"[{prefix}] 하드 스탑 발동! "
+                            f"upnl_A={upnl_a:+.4f} upnl_B={upnl_b:+.4f} "
+                            f"gross={gross_pnl:+.4f} fee={total_fee:.4f} "
+                            f"net={unrealized_net:+.4f} USDT ({unrealized_pct:+.2f}%) <= {MAX_LOSS_PCT}%"
+                        )
+                        await _execute_close(
+                            prefix, "STOP_LOSS", price_a, price_b,
+                            sym_a, sym_b, risk_manager, order_executor,
+                            bot_state, notifier, logger, dev,
+                            z_score=state["z_score"],
+                            close_reason=f"최대 허용 손실 초과({MAX_LOSS_PCT}%) 하드 스탑",
+                        )
+                        bot_state.cooldowns[prefix] = time.time()
+                        bot_state.daily_stop_counts[prefix] = bot_state.daily_stop_counts.get(prefix, 0) + 1
+                        await save_state(bot_state)
+                        entry_timestamp = 0.0
+                        if prefix in bot_state.pending_swaps:
+                            new_a, new_b = bot_state.pending_swaps.pop(prefix)
+                            new_prefix = make_prefix(new_a, new_b)
+                            _swap_pair_in_list(prefix, new_a, new_b)
+                            await save_state(bot_state)
+                            await notifier._send(f"🔄 [{prefix}] → [{new_prefix}] 바통 터치!")
+                            asyncio.create_task(pair_loop(new_a, new_b, exchange, order_executor, bot_state, notifier, entry_lock))
+                            return
+                        await asyncio.sleep(POLL_INTERVAL_SEC)
+                        continue
+
+                    # ── 우선순위 4: 통계 손절 — Z-Score >= 4.5 ──
+                    elif abs(state["z_score"]) >= STOP_LOSS_Z_SCORE:
+                        logger.warning(
+                            f"[{prefix}] 통계적 디커플링 손절! Z={state['z_score']:+.3f} >= {STOP_LOSS_Z_SCORE}"
+                        )
+                        await _execute_close(
+                            prefix, "STOP_LOSS", price_a, price_b,
+                            sym_a, sym_b, risk_manager, order_executor,
+                            bot_state, notifier, logger, dev,
+                            z_score=state["z_score"],
+                            close_reason=f"통계적 디커플링(Z={state['z_score']:+.2f} >= {STOP_LOSS_Z_SCORE}) 꼬리 끊기",
+                        )
+                        bot_state.cooldowns[prefix] = time.time()
+                        bot_state.daily_stop_counts[prefix] = bot_state.daily_stop_counts.get(prefix, 0) + 1
+                        await save_state(bot_state)
+                        entry_timestamp = 0.0
+                        if prefix in bot_state.pending_swaps:
+                            new_a, new_b = bot_state.pending_swaps.pop(prefix)
+                            new_prefix = make_prefix(new_a, new_b)
+                            _swap_pair_in_list(prefix, new_a, new_b)
+                            await save_state(bot_state)
+                            await notifier._send(f"🔄 [{prefix}] → [{new_prefix}] 바통 터치!")
+                            asyncio.create_task(pair_loop(new_a, new_b, exchange, order_executor, bot_state, notifier, entry_lock))
+                            return
+
+                    # ── Z-Score Zero-Cross 익절 (급등락 대비 보완) ──
+                    else:
+                        if pos.entry_z_score > 0 and state["z_score"] <= EXIT_Z_SCORE:
+                            signal = "EXIT"
+                        elif pos.entry_z_score < 0 and state["z_score"] >= -EXIT_Z_SCORE:
+                            signal = "EXIT"
+
+                        if signal == "EXIT":
+                            res_a = {"average": price_a, "qty": (pos.margin_a * LEVERAGE)/pos.price_a, "maker": True}
+                            res_b = {"average": price_b, "qty": (pos.margin_b * LEVERAGE)/pos.price_b, "maker": True}
+                            net_pnl, _ = bot_state.calc_pnl(pos, res_a, res_b)
+                            if net_pnl <= 0:
+                                logger.debug(f"[{prefix}] EXIT 시그널 무시 — Net PnL={net_pnl:+.4f} USDT (수수료 미충당)")
+                                await asyncio.sleep(POLL_INTERVAL_SEC)
+                                continue
                             await _execute_close(
                                 prefix, "TAKE_PROFIT", price_a, price_b,
                                 sym_a, sym_b, risk_manager, order_executor,
                                 bot_state, notifier, logger, dev,
                                 z_score=state["z_score"],
-                                close_reason=f"목표 순수익(+{TARGET_NET_PNL_PCT}%) 도달 익절",
                             )
                             entry_timestamp = 0.0
-                            # 청산 직후 pending_swap 바통 터치
                             if prefix in bot_state.pending_swaps:
                                 new_a, new_b = bot_state.pending_swaps.pop(prefix)
                                 new_prefix = make_prefix(new_a, new_b)
                                 _swap_pair_in_list(prefix, new_a, new_b)
                                 await save_state(bot_state)
-                                await notifier._send(f"🔄 [{prefix}] → [{new_prefix}] 바통 터치! 새 페어 워밍업 시작")
-                                asyncio.create_task(
-                                    pair_loop(new_a, new_b, exchange, order_executor, bot_state, notifier, entry_lock)
-                                )
-                                logger.info(f"[PendingSwap] {prefix} → {new_prefix} 교체 완료, 이 루프 종료")
+                                await notifier._send(f"🔄 [{prefix}] → [{new_prefix}] 바통 터치!")
+                                asyncio.create_task(pair_loop(new_a, new_b, exchange, order_executor, bot_state, notifier, entry_lock))
                                 return
-                            await asyncio.sleep(POLL_INTERVAL_SEC)
-                            continue
-
-                        # ── 하드 스탑 (Hard Stop): 최대 허용 손실률 초과 시 즉시 손절 ──
-                        # Z-Score가 STOP_LOSS_Z_SCORE(3.5)에 도달하지 않았더라도
-                        # 실시간 미실현 순손실이 MAX_LOSS_PCT(-3.5%)보다 더 내려가면 즉각 시장가 전량 손절
-                        elif unrealized_pct <= MAX_LOSS_PCT:
-                            logger.warning(
-                                f"[{prefix}] 하드 스탑 발동! "
-                                f"upnl_A={upnl_a:+.4f} upnl_B={upnl_b:+.4f} "
-                                f"gross={gross_pnl:+.4f} fee={total_fee:.4f} "
-                                f"net={unrealized_net:+.4f} USDT ({unrealized_pct:+.2f}%) <= {MAX_LOSS_PCT}%"
-                            )
-                            await _execute_close(
-                                prefix, "STOP_LOSS", price_a, price_b,
-                                sym_a, sym_b, risk_manager, order_executor,
-                                bot_state, notifier, logger, dev,
-                                z_score=state["z_score"],
-                                close_reason=f"최대 허용 손실 초과({MAX_LOSS_PCT}%) 하드 스탑",
-                            )
-                            bot_state.cooldowns[prefix] = time.time()
-                            bot_state.daily_stop_counts[prefix] = bot_state.daily_stop_counts.get(prefix, 0) + 1
-                            await save_state(bot_state)
-                            entry_timestamp = 0.0
-                            # 청산 직후 pending_swap 바통 터치
-                            if prefix in bot_state.pending_swaps:
-                                new_a, new_b = bot_state.pending_swaps.pop(prefix)
-                                new_prefix = make_prefix(new_a, new_b)
-                                _swap_pair_in_list(prefix, new_a, new_b)
-                                await save_state(bot_state)
-                                await notifier._send(f"🔄 [{prefix}] → [{new_prefix}] 바통 터치! 새 페어 워밍업 시작")
-                                asyncio.create_task(
-                                    pair_loop(new_a, new_b, exchange, order_executor, bot_state, notifier, entry_lock)
-                                )
-                                logger.info(f"[PendingSwap] {prefix} → {new_prefix} 교체 완료, 이 루프 종료")
-                                return
-                            await asyncio.sleep(POLL_INTERVAL_SEC)
-                            continue
-
-                    except Exception as e:
-                        logger.debug(f"[{prefix}] 미실현PnL 조회 실패 (스킵): {e}")
-
-                # ── Z-Score Zero-Cross 익절 안전장치 (급등락 대비 보완) ──
-                # Z-Score가 0을 완전히 관통해서 반대편으로 가버린 경우 강제 익절 처리
-                pos = bot_state.positions.get(prefix)
-                if pos and signal != "STOP":
-                    # 숏A 롱B 진입시 (Z>0에서 진입) -> Z가 EXIT_Z_SCORE 이하로 내려오면 익절
-                    if pos.entry_z_score > 0 and state["z_score"] <= EXIT_Z_SCORE:
-                        signal = "EXIT"
-                    # 롱A 숏B 진입시 (Z<0에서 진입) -> Z가 -EXIT_Z_SCORE 이상으로 올라가면 익절
-                    elif pos.entry_z_score < 0 and state["z_score"] >= -EXIT_Z_SCORE:
-                        signal = "EXIT"
-
-                # 청산 / 손절 판단 — 공통 핸들러로 위임 (포지션 보유 시에만 진입)
-                # 손절은 Z-Score STOP 시그널(abs_z >= 3.5)에만 의존
-                if signal == "STOP":
-                    await _execute_close(
-                        prefix, "STOP_LOSS", price_a, price_b,
-                        sym_a, sym_b, risk_manager, order_executor,
-                        bot_state, notifier, logger, dev,
-                        z_score=state["z_score"],
-                    )
-                    bot_state.cooldowns[prefix] = time.time()  # 쿨다운 타이머 시작
-                    bot_state.daily_stop_counts[prefix] = bot_state.daily_stop_counts.get(prefix, 0) + 1  # 일일 손절 카운터 증가
-                    await save_state(bot_state)
-                    entry_timestamp = 0.0
-                    # 청산 직후 pending_swap 바통 터치
-                    if prefix in bot_state.pending_swaps:
-                        new_a, new_b = bot_state.pending_swaps.pop(prefix)
-                        new_prefix = make_prefix(new_a, new_b)
-                        _swap_pair_in_list(prefix, new_a, new_b)
-                        await save_state(bot_state)
-                        await notifier._send(f"🔄 [{prefix}] → [{new_prefix}] 바통 터치! 새 페어 워밍업 시작")
-                        asyncio.create_task(
-                            pair_loop(new_a, new_b, exchange, order_executor, bot_state, notifier, entry_lock)
-                        )
-                        logger.info(f"[PendingSwap] {prefix} → {new_prefix} 교체 완료, 이 루프 종료")
-                        return
-
-                elif signal == "EXIT":
-                    # 익절 안전장치: Maker 수수료 기준 Net PnL 0 초과 시에만 청산
-                    pos = bot_state.positions.get(prefix)
-                    if pos:
-                        res_a = {"average": price_a, "qty": (pos.margin_a * LEVERAGE)/pos.price_a, "maker": True}
-                        res_b = {"average": price_b, "qty": (pos.margin_b * LEVERAGE)/pos.price_b, "maker": True}
-                        net_pnl, _ = bot_state.calc_pnl(pos, res_a, res_b)
-                        if net_pnl <= 0:
-                            logger.debug(
-                                f"[{prefix}] EXIT 시그널 무시 — "
-                                f"Net PnL={net_pnl:+.4f} USDT (Maker 수수료 미충당)"
-                            )
-                            await asyncio.sleep(POLL_INTERVAL_SEC)
-                            continue
-                    await _execute_close(
-                        prefix, "TAKE_PROFIT", price_a, price_b,
-                        sym_a, sym_b, risk_manager, order_executor,
-                        bot_state, notifier, logger, dev,
-                        z_score=state["z_score"],
-                    )
-                    entry_timestamp = 0.0
-                    # 청산 직후 pending_swap 바통 터치
-                    if prefix in bot_state.pending_swaps:
-                        new_a, new_b = bot_state.pending_swaps.pop(prefix)
-                        new_prefix = make_prefix(new_a, new_b)
-                        _swap_pair_in_list(prefix, new_a, new_b)
-                        await save_state(bot_state)
-                        await notifier._send(f"🔄 [{prefix}] → [{new_prefix}] 바통 터치! 새 페어 워밍업 시작")
-                        asyncio.create_task(
-                            pair_loop(new_a, new_b, exchange, order_executor, bot_state, notifier, entry_lock)
-                        )
-                        logger.info(f"[PendingSwap] {prefix} → {new_prefix} 교체 완료, 이 루프 종료")
-                        return
 
             # ── 5. 킬 스위치 검사 (30초마다) ────────────────────────────────────
             if int(time.time()) % 30 == 0:
