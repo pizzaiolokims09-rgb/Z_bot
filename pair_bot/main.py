@@ -1048,16 +1048,32 @@ async def main_loop():
     # ── 20개 페어 루프 + BTC 변동성 모니터 병렬 실행 ──────────────────────────
     entry_lock = asyncio.Lock()  # 신규 진입 동시성 제어용 Lock
     tasks = []
-    # Rate Limit 방어: 워밍업을 배치(5개씩)로 나눠 순차 시작
+    
+    # 1. PAIRS_TO_TRADE에 있는 페어들 워밍업/루프 등록
+    active_prefixes = set()
     for batch_start in range(0, len(PAIRS_TO_TRADE), WARMUP_BATCH_SIZE):
         batch = PAIRS_TO_TRADE[batch_start:batch_start + WARMUP_BATCH_SIZE]
         for sym_a, sym_b in batch:
+            prefix = make_prefix(sym_a, sym_b)
+            active_prefixes.add(prefix)
             tasks.append(
                 pair_loop(sym_a, sym_b, exchange, order_executor, bot_state, notifier, entry_lock)
             )
         if batch_start + WARMUP_BATCH_SIZE < len(PAIRS_TO_TRADE):
             logger.info(f"[워밍업 배치] {batch_start + WARMUP_BATCH_SIZE}/{len(PAIRS_TO_TRADE)}개 시작, 2초 대기...")
             await asyncio.sleep(2)  # 배치 간 2초 딜레이
+            
+    # 2. PAIRS_TO_TRADE에는 없지만 아직 안 닫힌 활성 포지션(고아 포지션) 강제 루프 할당 (좀비 방지)
+    for prefix, pos in bot_state.positions.items():
+        if prefix not in active_prefixes:
+            logger.warning(f"[고아 포지션 복구] {prefix} 페어가 감시 목록에 없지만 활성 포지션이 존재하여 강제로 감시 스레드를 생성합니다.")
+            # ccxt 심볼 포맷(예: RENDER/USDT:USDT)에서 일반 포맷(RENDER/USDT)으로 복원
+            sym_a = pos.sym_a.split(':')[0]
+            sym_b = pos.sym_b.split(':')[0]
+            tasks.append(
+                pair_loop(sym_a, sym_b, exchange, order_executor, bot_state, notifier, entry_lock)
+            )
+
     tasks.append(btc_turbulence_monitor(exchange, bot_state, notifier))
 
     try:
