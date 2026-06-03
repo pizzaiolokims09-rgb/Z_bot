@@ -24,7 +24,7 @@ from config import (
     MAX_BTC_VOLATILITY, BTC_VOLATILITY_CHECK_INTERVAL,
     STOP_LOSS_COOLDOWN_SEC,
     MAX_STOP_LOSS_PER_PAIR, MAX_HOLD_SECONDS,
-    WARMUP_BATCH_SIZE, EXIT_Z_SCORE,
+    WARMUP_BATCH_SIZE, EXIT_Z_SCORE, TARGET_NET_PNL_PCT,
     ENTRY_CONFIRMATION_SEC,
 )
 from spread_engine      import SpreadEngine
@@ -166,6 +166,7 @@ async def _execute_close(
     logger: logging.Logger,
     dev: float,
     z_score: float = 0.0,      # 청산 시점 Z-Score (CSV 로깅용)
+    close_reason: str = "",    # 상세 청산 사유 (텔레그램 알림용)
 ):
     """청산 주문 → Net PnL 계산(실체결가 기반) → 상태 정리 → 텔레그램 알림 → CSV 기록 → 상태 저장."""
     pos = bot_state.positions.get(prefix)
@@ -216,13 +217,14 @@ async def _execute_close(
             f"[{prefix}] 킬스위치 청산 | Net PnL={pnl_usdt:+.4f} USDT [실체결가 기준]"
         )
     else:
+        reason_tag = close_reason if close_reason else "괴리 회귀"
         logger.info(
-            f"[{prefix}] 익절 | 괴리 회귀 | dev={dev:+.3f}% | "
+            f"[{prefix}] 익절 | {reason_tag} | dev={dev:+.3f}% | "
             f"Net PnL={pnl_usdt:+.4f} USDT ({pnl_pct:+.3f}%) [실체결가 기준]"
         )
 
     risk_manager.close_position(prefix)
-    await notifier.send_exit(prefix, pnl_usdt, pnl_pct, reason)
+    await notifier.send_exit(prefix, pnl_usdt, pnl_pct, reason, close_reason=close_reason)
 
     # CSV 로깅 & 상태 저장
     if pos:
@@ -725,14 +727,48 @@ async def pair_loop(
                                 await asyncio.sleep(POLL_INTERVAL_SEC)
                                 continue
 
+                # ── Net PnL % 기반 하이브리드 익절 (Z-Score 무관) ──
+                pos = bot_state.positions.get(prefix)
+                if pos and signal not in ("STOP", "EXIT"):
+                    res_a = {"average": price_a, "qty": (pos.margin_a * LEVERAGE)/pos.price_a, "maker": True}
+                    res_b = {"average": price_b, "qty": (pos.margin_b * LEVERAGE)/pos.price_b, "maker": True}
+                    net_pnl, net_pnl_pct = bot_state.calc_pnl(pos, res_a, res_b)
+                    if net_pnl_pct >= TARGET_NET_PNL_PCT:
+                        logger.info(
+                            f"[{prefix}] 목표 순수익 도달! Net PnL={net_pnl:+.4f} USDT "
+                            f"({net_pnl_pct:+.2f}% >= {TARGET_NET_PNL_PCT}%)"
+                        )
+                        await _execute_close(
+                            prefix, "TAKE_PROFIT", price_a, price_b,
+                            sym_a, sym_b, risk_manager, order_executor,
+                            bot_state, notifier, logger, dev,
+                            z_score=state["z_score"],
+                            close_reason=f"목표 순수익(+{TARGET_NET_PNL_PCT}%) 도달 익절",
+                        )
+                        entry_timestamp = 0.0
+                        # 청산 직후 pending_swap 바통 터치
+                        if prefix in bot_state.pending_swaps:
+                            new_a, new_b = bot_state.pending_swaps.pop(prefix)
+                            new_prefix = make_prefix(new_a, new_b)
+                            _swap_pair_in_list(prefix, new_a, new_b)
+                            await save_state(bot_state)
+                            await notifier._send(f"🔄 [{prefix}] → [{new_prefix}] 바통 터치! 새 페어 워밍업 시작")
+                            asyncio.create_task(
+                                pair_loop(new_a, new_b, exchange, order_executor, bot_state, notifier, entry_lock)
+                            )
+                            logger.info(f"[PendingSwap] {prefix} → {new_prefix} 교체 완료, 이 루프 종료")
+                            return
+                        await asyncio.sleep(POLL_INTERVAL_SEC)
+                        continue
+
                 # ── Z-Score Zero-Cross 익절 안전장치 (급등락 대비 보완) ──
                 # Z-Score가 0을 완전히 관통해서 반대편으로 가버린 경우 강제 익절 처리
                 pos = bot_state.positions.get(prefix)
                 if pos and signal != "STOP":
-                    # 숏A 롱B 진입시 (Z>0에서 진입) -> Z가 0 이하로 내려오면 익절
+                    # 숏A 롱B 진입시 (Z>0에서 진입) -> Z가 EXIT_Z_SCORE 이하로 내려오면 익절
                     if pos.entry_z_score > 0 and state["z_score"] <= EXIT_Z_SCORE:
                         signal = "EXIT"
-                    # 롱A 숏B 진입시 (Z<0에서 진입) -> Z가 0 이상으로 올라가면 익절
+                    # 롱A 숏B 진입시 (Z<0에서 진입) -> Z가 -EXIT_Z_SCORE 이상으로 올라가면 익절
                     elif pos.entry_z_score < 0 and state["z_score"] >= -EXIT_Z_SCORE:
                         signal = "EXIT"
 

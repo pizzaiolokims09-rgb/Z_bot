@@ -119,11 +119,12 @@ class TelegramNotifier:
         pnl_usdt: float,
         pnl_pct: float,
         reason: str,
+        close_reason: str = "",
     ) -> None:
         """청산/손절 알림 + PnL 전송."""
         if reason == "TAKE_PROFIT":
             tag   = "청산"
-            desc  = "괴리 회귀 완료"
+            desc  = close_reason if close_reason else "괴리 회귀 완료"
             emoji = "📈" if pnl_usdt >= 0 else "📉"
         elif reason == "MANUAL":
             tag   = "수동 청산"
