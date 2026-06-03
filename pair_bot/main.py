@@ -80,13 +80,38 @@ def make_prefix(sym_a: str, sym_b: str) -> str:
 
 
 def _swap_pair_in_list(old_prefix: str, new_sym_a: str, new_sym_b: str) -> bool:
-    """PAIRS_TO_TRADE 리스트에서 old_prefix에 해당하는 페어를 찾아 새 페어로 교체."""
+    """PAIRS_TO_TRADE 리스트에서 old_prefix에 해당하는 페어를 찾아 새 페어로 교체.
+    
+    중복 방어: 새 페어가 이미 리스트에 존재하면 추가하지 않음.
+    고아 방어: old_prefix를 찾아 제거 후 새 페어로 교체.
+    """
+    new_prefix = f"{new_sym_a.split('/')[0]}-{new_sym_b.split('/')[0]}"
+
+    # 1단계: old_prefix 위치 탐색
+    old_idx = None
     for i, (a, b) in enumerate(PAIRS_TO_TRADE):
         if make_prefix(a, b) == old_prefix:
-            PAIRS_TO_TRADE[i] = (new_sym_a, new_sym_b)
-            return True
-    PAIRS_TO_TRADE.append((new_sym_a, new_sym_b))
-    return False
+            old_idx = i
+            break
+
+    # 2단계: 새 페어가 이미 리스트에 존재하는지 확인
+    new_already_exists = any(
+        make_prefix(a, b) == new_prefix for a, b in PAIRS_TO_TRADE
+    )
+
+    if old_idx is not None:
+        if new_already_exists:
+            # 새 페어가 이미 있으면, 기존(old) 자리만 삭제 (중복 방지)
+            del PAIRS_TO_TRADE[old_idx]
+        else:
+            # 기존 자리를 새 페어로 교체
+            PAIRS_TO_TRADE[old_idx] = (new_sym_a, new_sym_b)
+        return True
+    else:
+        # old_prefix를 못 찾음 — 새 페어 중복 없으면 추가
+        if not new_already_exists:
+            PAIRS_TO_TRADE.append((new_sym_a, new_sym_b))
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -846,6 +871,36 @@ async def main_loop():
                 logger.info(f"    [{make_prefix(sym_a, sym_b):12s}]  {sym_a}  /  {sym_b}")
         else:
             logger.info("[PairOverride] 저장된 페어 리스트 없음 → config.py 기본값 유지")
+
+    # ── PAIRS_TO_TRADE 중복 제거 (유령 중복 방어) ──
+    seen = set()
+    deduped = []
+    for pair in PAIRS_TO_TRADE:
+        prefix = make_prefix(pair[0], pair[1])
+        if prefix not in seen:
+            seen.add(prefix)
+            deduped.append(pair)
+    if len(deduped) != len(PAIRS_TO_TRADE):
+        removed = len(PAIRS_TO_TRADE) - len(deduped)
+        logger.warning(f"[Dedup] PAIRS_TO_TRADE에서 중복 {removed}개 제거")
+        PAIRS_TO_TRADE.clear()
+        PAIRS_TO_TRADE.extend(deduped)
+
+    # ── 꼬인 pending_swaps 안전 리셋 (임시 치료용) ──
+    if bot_state.pending_swaps:
+        # 실제 활성 포지션이 없는 pending만 제거
+        stale_keys = [
+            k for k in bot_state.pending_swaps
+            if k not in bot_state.positions
+        ]
+        if stale_keys:
+            for k in stale_keys:
+                del bot_state.pending_swaps[k]
+            logger.warning(
+                f"[PendingSwap] 포지션 없는 좀비 대기열 {len(stale_keys)}건 제거: "
+                f"{stale_keys}"
+            )
+            await save_state(bot_state)
 
     # ── 바이낸스 API와의 실시간 교차 검증 (Source of Truth) ──
     if bot_state.positions:

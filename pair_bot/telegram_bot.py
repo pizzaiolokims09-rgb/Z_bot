@@ -264,13 +264,17 @@ class TelegramNotifier:
                 for c in coins:
                     _coin_to_sector[c] = sec_name
 
-            # 섹터별로 페어 그룹핑
+            # 섹터별로 페어 그룹핑 (중복 제거)
             sector_pairs = {}  # {섹터명: [prefix, ...]}
             uncategorized = []
+            seen_prefixes = set()
             for sym_a, sym_b in PAIRS_TO_TRADE:
                 a_base = sym_a.split("/")[0]
                 b_base = sym_b.split("/")[0]
                 prefix = f"{a_base}-{b_base}"
+                if prefix in seen_prefixes:
+                    continue  # 중복 페어 무시
+                seen_prefixes.add(prefix)
                 sec_a = _coin_to_sector.get(a_base, "")
                 sec_b = _coin_to_sector.get(b_base, "")
                 sec = sec_a or sec_b or ""
@@ -700,7 +704,8 @@ class TelegramNotifier:
                 f"기존 포지션은 절대 강제 청산하지 않습니다."
             )
         else:
-            # 활성 포지션 없음 → 즉시 교체
+            # 활성 포지션 없음 → 즉시 교체 (pending_swaps에 넣지 않음!)
+            # 기존 페어 찾아서 교체
             swapped = False
             for i, (a, b) in enumerate(PAIRS_TO_TRADE):
                 pf = f"{a.split('/')[0]}-{b.split('/')[0]}"
@@ -709,21 +714,21 @@ class TelegramNotifier:
                     swapped = True
                     break
             if not swapped:
-                PAIRS_TO_TRADE.append((new_a, new_b))
+                # 새 페어가 이미 리스트에 있는지 중복 체크
+                already_exists = any(
+                    f"{a.split('/')[0]}-{b.split('/')[0]}" == new_prefix
+                    for a, b in PAIRS_TO_TRADE
+                )
+                if not already_exists:
+                    PAIRS_TO_TRADE.append((new_a, new_b))
 
             await save_state(self._state)
-            logger.info(f"[PendingSwap] 즉시 교체: {old_prefix} → {new_prefix}")
+            logger.info(f"[ImmediateSwap] 즉시 교체: {old_prefix} → {new_prefix}")
             await query.edit_message_text(
                 f"🔄 즉시 교체 완료!\n\n"
                 f"[{old_prefix}] → [{new_prefix}]\n"
-                f"새 페어 루프가 자동으로 시작됩니다.\n"
-                f"24시간 과거 데이터 워밍업 진행 중..."
+                f"다음 매매 사이클부터 새 페어로 감시를 시작합니다."
             )
-
-            # 기존 루프 종료 신호 + 새 루프 시작은 main.py의 swap_executor가 처리
-            # bot_state에 즉시 교체 완료 플래그 등록
-            self._state.pending_swaps[old_prefix] = (new_a, new_b)
-            await save_state(self._state)
 
     # =========================================================================
     # 내부 전송 헬퍼
