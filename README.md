@@ -1,23 +1,24 @@
 # Z_bot — 통계적 차익거래 페어 트레이딩 봇
 
-바이낸스 선물(USDT-M) 기반 5개 페어 동시 감시, Z-Score 하이브리드 진입, 자동 위험 관리, 텔레그램 실시간 제어가 통합된 자동화 트레이딩 봇입니다.
+바이낸스 선물(USDT-M) 기반 동시 감시, Z-Score 하이브리드 진입, 자동 위험 관리, **이중 방어 체계(스마트 손절 + 하드 스탑)** 및 텔레그램 실시간 제어가 통합된 자동화 트레이딩 봇입니다.
 
 ---
 
 ## 프로젝트 구조
 
-```
+```text
 Z_bot/
 └── pair_bot/
-    ├── main.py              # 메인 실행 진입점 (5개 페어 병렬 루프)
-    ├── config.py            # 전역 설정값 (임계치, 레버리지, 수수료 등)
+    ├── main.py              # 메인 실행 진입점 (통합 청산 체인 및 페어 병렬 루프)
+    ├── config.py            # 전역 설정값 (임계치, 레버리지, 수수료, 섹터 등)
     ├── spread_engine.py     # Z-Score / 괴리율 계산 (하이브리드 진입 신호)
-    ├── risk_manager.py      # 포지션 사이징 / 손절 판단
+    ├── risk_manager.py      # 포지션 사이징 / 마진 관리
+    ├── pair_scanner.py      # 비동기 섹터 스캐너 (ADF/상관계수 기반 페어 발굴)
     ├── order_executor.py    # CCXT 비동기 주문 실행 + 레버리지 세팅
-    ├── bot_state.py         # 공유 상태 객체 (포지션, PnL, 잔고)
-    ├── telegram_bot.py      # 텔레그램 알림 + 인라인 컨트롤 패널
+    ├── bot_state.py         # 공유 상태 객체 (포지션, PnL, 잔고, 대기 중인 교체 큐)
+    ├── telegram_bot.py      # 텔레그램 알림 + 인라인 컨트롤 패널 (스캔/교체 UI)
     ├── trade_logger.py      # 매매 결과 CSV 비동기 기록
-    ├── state_persistence.py # bot_state.json 저장/복구
+    ├── state_persistence.py # bot_state.json 저장/복구 (기억 상실 방지)
     ├── .env                 # API 키, 텔레그램 토큰 (Git 제외)
     ├── .env.example         # 환경 변수 작성 예시
     ├── trade_history.csv    # 매매 기록 (자동 생성)
@@ -34,7 +35,7 @@ Z_bot/
 # Windows PowerShell (pair_bot 폴더 기준)
 python -m venv venv
 venv\Scripts\Activate.ps1
-pip install ccxt python-telegram-bot aiofiles python-dotenv
+pip install ccxt python-telegram-bot aiofiles python-dotenv numpy statsmodels
 ```
 
 ### 2. `.env` 파일 작성
@@ -54,10 +55,6 @@ TELEGRAM_CHAT_ID=여기에_채팅_ID
 # 바이낸스 데모 계정(demo.binance.com) 연동 시:
 IS_PAPER_TRADING=false
 USE_TESTNET=true
-
-# 완전 내부 가상 시뮬레이션(API 연결 없음) 시:
-# IS_PAPER_TRADING=true
-# USE_TESTNET=false
 ```
 
 | 변수 | 설명 |
@@ -82,16 +79,6 @@ cd pair_bot
 python main.py
 ```
 
-정상 실행 시 터미널 출력:
-
-```
-[거래소] 데모 트레이딩 모드 활성화 (demo.binance.com)
-[API 연결 성공] 모의투자 계좌 가용 잔고: 5000.00 USDT
-[레버리지] BTC/USDT:USDT → 5x 세팅 완료
-...
-[텔레그램] 봇 폴링 시작
-```
-
 종료: `Ctrl+C`
 
 ---
@@ -100,68 +87,61 @@ python main.py
 
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
-| `LEVERAGE` | 5 | 선물 레버리지 배수 (봇 시작 시 API 자동 적용) |
+| `LEVERAGE` | 5 | 선물 레버리지 배수 |
 | `ALLOCATION_PER_PAIR` | 0.14 | 페어당 자금 배분 비율 (14%) |
+| `TARGET_NET_PNL_PCT` | 3.5 | **목표 순수익 익절 한도 (%)** |
+| `MAX_LOSS_PCT` | -3.5 | **하드 스탑 최대 허용 손실률 (%)** |
 | `ENTRY_Z_SCORE` | 2.0 | 진입 Z-Score 임계치 |
-| `EXIT_Z_SCORE` | 0.5 | 익절 Z-Score 임계치 |
-| `STOP_LOSS_Z_SCORE` | 4.0 | 손절 Z-Score 임계치 |
-| `MIN_SPREAD_THRESHOLD` | 0.5 | 하이브리드 진입 최소 괴리율 (%) |
-| `MAX_DRAWDOWN_LIMIT` | -0.05 | 킬 스위치 발동 손실 한도 (-5%) |
-| `MAX_BTC_VOLATILITY` | 2.0 | BTC 15분 변동성 필터 임계치 (%) |
-| `TAKER_FEE_RATE` | 0.0005 | 바이낸스 Taker 수수료 (0.05%) |
-| `POLL_INTERVAL_SEC` | 1.0 | 가격 조회 주기 (초) |
+| `STOP_LOSS_Z_SCORE` | 4.5 | **통계적 디커플링 손절 임계치** (잔파도 무시용) |
+| `CORR_WINDOW_MIN` | 60 | **스마트 손절** 상관계수 측정 단위 (분) |
+| `CORR_STOP_THRESHOLD`| 0.0 | **스마트 손절** 발동 임계치 (0 이하 역방향 시 손절) |
+| `MAX_DRAWDOWN_LIMIT` | -0.05 | 글로벌 킬 스위치 발동 전체 손실 한도 (-5%) |
 
 ---
 
-## 핵심 매매 로직
-
-### 감시 페어 (5개)
-
-| 페어 ID | 심볼 A | 심볼 B |
-|---------|--------|--------|
-| BTC-ETH | BTC/USDT | ETH/USDT |
-| SOL-AVAX | SOL/USDT | AVAX/USDT |
-| XRP-ADA | XRP/USDT | ADA/USDT |
-| DOGE-1000SHIB | DOGE/USDT | 1000SHIB/USDT |
-| LINK-DOT | LINK/USDT | DOT/USDT |
+## 핵심 매매 로직 및 5단계 청산 체인
 
 ### 하이브리드 진입 조건 (AND)
 
 아래 두 조건을 동시에 충족할 때만 양방향 시장가 주문 실행:
-
 - **조건 A**: 가격 비율의 Z-Score ≥ 2.0 (볼린저 밴드 기준)
 - **조건 B**: 실시간 가격 괴리율 ≥ 0.5%
 
-### 청산 조건
+### 통합 청산 우선순위 체인 (손익비 1:1 이중 방어)
 
-| 유형 | 조건 |
-|------|------|
-| 익절 | Z-Score ≤ 0.5 이면서 Net PnL > 0 |
-| 손절 | Z-Score ≥ 4.0 |
-| 수동 | 텔레그램 버튼 |
+포지션 진입 후 10초마다 아래 5단계 우선순위로 상태를 검사합니다. 계산 시 수수료를 차감한 진짜 **Net PnL**을 사용합니다.
 
-### Net PnL 계산
+| 우선순위 | 조건 | 실행 내용 |
+|:---:|:---|:---|
+| **1** | **Net PnL ≥ +3.5%** | **목표 수익 익절:** 즉각적인 시장가 익절 처리 |
+| **2** | **피어슨 상관계수 ≤ 0.0** | **스마트 손절:** 60분 간의 1분봉 상관계수가 0 이하(역방향 진행)일 경우 즉각 꼬리 끊기 |
+| **3** | **Net PnL ≤ -3.5%** | **하드 스탑:** Z-Score 도달 여부와 무관하게 순손실이 -3.5%를 넘어가면 무조건 손절 |
+| **4** | **abs(Z-Score) ≥ 4.5** | **통계 손절:** 통계적으로 극단적인 디커플링 진입 시 손절 |
+| **5** | **Z-Score 회귀 (EXIT)** | **회귀 익절:** Z-Score가 0을 향해 완전히 관통하고 Net PnL이 양수일 경우 익절 |
 
-```
-Net PnL = 총 실현손익 - 수수료 (Taker 0.05% × 4회 = 0.2%)
-```
+---
+
+## 자동화된 섹터 스캐너 및 안전 교체 (Pending Swap)
+
+### 1. 백그라운드 스캐너 (`pair_scanner.py`)
+텔레그램의 "페어 스캔" 버튼을 통해 L1 메이저, DeFi, AI, Meme 등 **10가지 섹터**의 코인들을 비동기/논블로킹으로 스캔합니다.
+ADF(Augmented Dickey-Fuller) 공적분 테스트와 피어슨 상관계수를 조합하여 가장 매매하기 좋은 최적의 페어를 발굴합니다.
+
+### 2. 안전 교체 시스템 (Pending Swap)
+기존에 진입해 있는 포지션이 있을 경우 즉시 교체하지 않고 **예약 대기(Pending) 상태**로 둡니다. 이후 5단계 청산 체인에 의해 기존 포지션이 익절/손절되어 빈자리가 나면, 봇이 즉시 새로운 페어로 바통 터치를 수행하여 끊김 없이 매매를 이어갑니다.
 
 ---
 
 ## 방어 로직 3종
 
 ### 1. Legging Risk (짝짝이 체결) 방어
-
 양방향 주문 실행 후 한쪽만 체결됐을 경우, 체결된 쪽을 즉시 시장가 롤백하여 단방향 노출(Naked Position) 원천 차단.
 
 ### 2. 글로벌 킬 스위치
-
 초기 잔고 대비 누적 손실이 **-5%** 를 초과하면 전 포지션 강제 청산 후 봇 자동 종료.
 
 ### 3. BTC 시장 폭주 감지 필터
-
-BTC/USDT 15분봉 변동성 `(High-Low)/Low×100` 이 **2%** 초과 시 신규 진입 전면 차단.
-기존 포지션의 익절/손절 감시는 계속 작동.
+BTC/USDT 15분봉 변동성 `(High-Low)/Low×100` 이 **2%** 초과 시 신규 진입 전면 차단. 기존 포지션의 익절/손절 감시는 유지.
 
 ---
 
@@ -172,39 +152,11 @@ BTC/USDT 15분봉 변동성 `(High-Low)/Low×100` 이 **2%** 초과 시 신규 �
 | 버튼 | 기능 |
 |------|------|
 | 🔘 수동 청산 | 특정 페어 즉시 시장가 청산 |
-| 🛑 봇 정지 | 신규 진입 일시 중단 (기존 포지션 감시 유지) |
-| ▶️ 봇 재시작 | 신규 진입 재개 |
+| 🛑 봇 정지 / ▶️ 봇 재시작 | 신규 진입 일시 중단 및 재개 (기존 포지션 유지) |
 | 📊 상태 확인 | 현재 잔고 + 활성 포지션 목록 |
 | 💰 승률 & PnL | 누적 거래 통계 |
-
-수동 청산 / 봇 정지 / 봇 재시작은 오터치 방지를 위해 확인 버튼 1회 추가.
-
----
-
-## 데이터 파일
-
-### trade_history.csv
-
-매 거래 완료 시 자동 기록 (ML 파라미터 최적화 활용 목적):
-
-```
-Entry_Time, Exit_Time, Pair, Trade_Duration_Sec,
-Entry_Z_Score, Exit_Z_Score, PnL_USDT, PnL_Percent, Exit_Reason
-```
-
-### bot_state.json
-
-봇 재구동 시 이전 포지션 상태와 누적 통계 자동 복구.
-진입/청산 시마다 즉시 덮어쓰기 저장.
+| 🔍 페어 스캔 | 10개 섹터 스캔 및 실시간 페어 교체 (Pending Swap) |
 
 ---
-
-## 모드 전환 안내
-
-| 목적 | IS_PAPER_TRADING | USE_TESTNET |
-|------|-----------------|-------------|
-| 내부 가상 시뮬레이션 | `true` | 무관 |
-| 바이낸스 데모 계정 연동 | `false` | `true` |
-| 실거래 (Mainnet) | `false` | `false` |
 
 > 실거래 전환 시 반드시 Mainnet API 키로 교체 후 충분한 데모 검증을 완료하십시오.
