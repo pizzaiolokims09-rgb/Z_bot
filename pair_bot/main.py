@@ -733,10 +733,8 @@ async def pair_loop(
                 pos = bot_state.positions.get(prefix)
                 if pos and signal not in ("STOP", "EXIT"):
                     try:
-                        # 거래소에서 두 레그의 미실현 PnL 직접 조회
-                        positions_raw = await asyncio.get_running_loop().run_in_executor(
-                            None, lambda: exchange.fetch_positions([sym_a, sym_b])
-                        )
+                        # 거래소에서 두 레그의 미실현 PnL 직접 조회 (ccxt.async_support 사용 중이므로 직접 await)
+                        positions_raw = await exchange.fetch_positions([sym_a, sym_b])
                         upnl_a = 0.0
                         upnl_b = 0.0
                         for p in positions_raw:
