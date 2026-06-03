@@ -256,11 +256,51 @@ class TelegramNotifier:
                     cd_lines.append(f"  • [{p}] 🚫 {time_str} 남음")
             cd_text = "\n".join(cd_lines) if cd_lines else "  없음"
 
+            # ── 현재 감시 유니버스 브리핑 ──
+            from config import PAIRS_TO_TRADE
+            # 섹터 역매핑: 코인 → 섹터 이름
+            _coin_to_sector = {}
+            for sec_name, coins in SECTORS.items():
+                for c in coins:
+                    _coin_to_sector[c] = sec_name
+
+            # 섹터별로 페어 그룹핑
+            sector_pairs = {}  # {섹터명: [prefix, ...]}
+            uncategorized = []
+            for sym_a, sym_b in PAIRS_TO_TRADE:
+                a_base = sym_a.split("/")[0]
+                b_base = sym_b.split("/")[0]
+                prefix = f"{a_base}-{b_base}"
+                sec_a = _coin_to_sector.get(a_base, "")
+                sec_b = _coin_to_sector.get(b_base, "")
+                sec = sec_a or sec_b or ""
+                if sec:
+                    sector_pairs.setdefault(sec, []).append(prefix)
+                else:
+                    uncategorized.append(prefix)
+
+            univ_lines = []
+            for sec_name, prefixes in sector_pairs.items():
+                pair_str = "  ".join(prefixes)
+                univ_lines.append(f"  [{sec_name}] {pair_str}")
+            if uncategorized:
+                univ_lines.append(f"  [기타] {'  '.join(uncategorized)}")
+            univ_text = "\n".join(univ_lines) if univ_lines else "  없음"
+
+            # pending_swaps 표시
+            swap_lines = []
+            for old_p, (new_a, new_b) in self._state.pending_swaps.items():
+                new_p = f"{new_a.split('/')[0]}-{new_b.split('/')[0]}"
+                swap_lines.append(f"  • [{old_p}] → [{new_p}]")
+            swap_text = "\n".join(swap_lines) if swap_lines else "  없음"
+
             await update.message.reply_text(
                 f"📊 봇 상태: {status_str}\n"
                 f"가용 잔고: {bal_str}\n\n"
                 f"활성 포지션 ({len(self._state.positions)}개):\n{pos_text}\n\n"
-                f"블랙리스트 (쿨다운 중):\n{cd_text}",
+                f"블랙리스트 (쿨다운 중):\n{cd_text}\n\n"
+                f"🔭 감시 유니버스 ({len(PAIRS_TO_TRADE)}개 페어):\n{univ_text}\n\n"
+                f"⏳ 교체 예약 (Pending Swap):\n{swap_text}",
                 reply_markup=self._reply_keyboard(),
             )
 
@@ -587,25 +627,57 @@ class TelegramNotifier:
         # 최적 페어에 대해 교체 대상 선택 UI
         best = results[0]
         lines.append(f"\n추천 페어: {best['pair']} (score={best['score']:.4f})")
+
+        # ── 중복 코인 경고 (Intersection 검사) ──
+        from config import PAIRS_TO_TRADE
+        new_coins = {best['sym_a'].split('/')[0], best['sym_b'].split('/')[0]}
+        overlapping_pairs = []  # (prefix, 겹치는 코인들)
+        for sym_a, sym_b in PAIRS_TO_TRADE:
+            a_base = sym_a.split('/')[0]
+            b_base = sym_b.split('/')[0]
+            existing_coins = {a_base, b_base}
+            overlap = new_coins & existing_coins
+            if overlap:
+                prefix = f"{a_base}-{b_base}"
+                overlapping_pairs.append((prefix, overlap))
+
+        if overlapping_pairs:
+            lines.append("")
+            for ov_prefix, ov_coins in overlapping_pairs:
+                coin_str = ", ".join(ov_coins)
+                lines.append(
+                    f"⚠️ 집중 리스크 경고: [{coin_str}] 코인이 "
+                    f"이미 기존 페어([{ov_prefix}])에 존재합니다!"
+                )
+            lines.append("\n중복 페어를 우선 교체하는 것을 권장합니다.")
+
         lines.append("\n어떤 기존 페어와 교체할까요?")
 
-        from config import PAIRS_TO_TRADE
-        buttons = []
+        # 교체 대상 버튼 생성 (겹치는 페어 최상단 배치)
+        overlap_prefixes = {p for p, _ in overlapping_pairs}
+        overlap_buttons = []
+        normal_buttons = []
         for sym_a, sym_b in PAIRS_TO_TRADE:
             prefix = f"{sym_a.split('/')[0]}-{sym_b.split('/')[0]}"
             pos_mark = "📌" if prefix in self._state.positions else "⚪"
             pending_mark = "⏳" if prefix in self._state.pending_swaps else ""
-            buttons.append([InlineKeyboardButton(
-                f"{pos_mark}{pending_mark} {prefix}",
+            btn = [InlineKeyboardButton(
+                f"{'🚨' if prefix in overlap_prefixes else ''}{pos_mark}{pending_mark} {prefix}",
                 callback_data=f"swap_target:{prefix}:{best['sym_a']}:{best['sym_b']}"
-            )])
+            )]
+            if prefix in overlap_prefixes:
+                overlap_buttons.append(btn)
+            else:
+                normal_buttons.append(btn)
+        buttons = overlap_buttons + normal_buttons
         buttons.append([InlineKeyboardButton("❌ 교체 안 함", callback_data="swap_cancel")])
 
         await self._send("\n".join(lines))
+        legend = "교체할 기존 페어를 선택하세요:\n"
+        legend += "(🚨 = 중복 노출, 📌 = 활성 포지션, ⏳ = 교체 예약 중)"
         await self._app.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text="교체할 기존 페어를 선택하세요:\n"
-                 "(📌 = 활성 포지션, ⏳ = 교체 예약 중)",
+            text=legend,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
 
