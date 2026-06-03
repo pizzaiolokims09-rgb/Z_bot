@@ -26,7 +26,7 @@ from config import (
     MAX_STOP_LOSS_PER_PAIR, MAX_HOLD_SECONDS,
     WARMUP_BATCH_SIZE, EXIT_Z_SCORE, TARGET_NET_PNL_PCT,
     TAKER_FEE_RATE, MAKER_FEE_RATE,
-    ENTRY_CONFIRMATION_SEC,
+    ENTRY_CONFIRMATION_SEC, MAX_LOSS_PCT,
 )
 from spread_engine      import SpreadEngine
 from risk_manager       import RiskManager
@@ -801,6 +801,43 @@ async def pair_loop(
                                 return
                             await asyncio.sleep(POLL_INTERVAL_SEC)
                             continue
+
+                        # ── 하드 스탑 (Hard Stop): 최대 허용 손실률 초과 시 즉시 손절 ──
+                        # Z-Score가 STOP_LOSS_Z_SCORE(3.5)에 도달하지 않았더라도
+                        # 실시간 미실현 순손실이 MAX_LOSS_PCT(-3.5%)보다 더 내려가면 즉각 시장가 전량 손절
+                        elif unrealized_pct <= MAX_LOSS_PCT:
+                            logger.warning(
+                                f"[{prefix}] 하드 스탑 발동! "
+                                f"upnl_A={upnl_a:+.4f} upnl_B={upnl_b:+.4f} "
+                                f"gross={gross_pnl:+.4f} fee={total_fee:.4f} "
+                                f"net={unrealized_net:+.4f} USDT ({unrealized_pct:+.2f}%) <= {MAX_LOSS_PCT}%"
+                            )
+                            await _execute_close(
+                                prefix, "STOP_LOSS", price_a, price_b,
+                                sym_a, sym_b, risk_manager, order_executor,
+                                bot_state, notifier, logger, dev,
+                                z_score=state["z_score"],
+                                close_reason=f"최대 허용 손실 초과({MAX_LOSS_PCT}%) 하드 스탑",
+                            )
+                            bot_state.cooldowns[prefix] = time.time()
+                            bot_state.daily_stop_counts[prefix] = bot_state.daily_stop_counts.get(prefix, 0) + 1
+                            await save_state(bot_state)
+                            entry_timestamp = 0.0
+                            # 청산 직후 pending_swap 바통 터치
+                            if prefix in bot_state.pending_swaps:
+                                new_a, new_b = bot_state.pending_swaps.pop(prefix)
+                                new_prefix = make_prefix(new_a, new_b)
+                                _swap_pair_in_list(prefix, new_a, new_b)
+                                await save_state(bot_state)
+                                await notifier._send(f"🔄 [{prefix}] → [{new_prefix}] 바통 터치! 새 페어 워밍업 시작")
+                                asyncio.create_task(
+                                    pair_loop(new_a, new_b, exchange, order_executor, bot_state, notifier, entry_lock)
+                                )
+                                logger.info(f"[PendingSwap] {prefix} → {new_prefix} 교체 완료, 이 루프 종료")
+                                return
+                            await asyncio.sleep(POLL_INTERVAL_SEC)
+                            continue
+
                     except Exception as e:
                         logger.debug(f"[{prefix}] 미실현PnL 조회 실패 (스킵): {e}")
 
