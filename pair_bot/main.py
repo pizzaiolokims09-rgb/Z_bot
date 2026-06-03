@@ -25,6 +25,7 @@ from config import (
     STOP_LOSS_COOLDOWN_SEC,
     MAX_STOP_LOSS_PER_PAIR, MAX_HOLD_SECONDS,
     WARMUP_BATCH_SIZE, EXIT_Z_SCORE, TARGET_NET_PNL_PCT,
+    TAKER_FEE_RATE, MAKER_FEE_RATE,
     ENTRY_CONFIRMATION_SEC,
 )
 from spread_engine      import SpreadEngine
@@ -728,15 +729,44 @@ async def pair_loop(
                                 continue
 
                 # ── Net PnL % 기반 하이브리드 익절 (Z-Score 무관) ──
+                # calc_pnl()에 의존하지 않고, 방향별 부호를 직접 계산
                 pos = bot_state.positions.get(prefix)
                 if pos and signal not in ("STOP", "EXIT"):
-                    res_a = {"average": price_a, "qty": (pos.margin_a * LEVERAGE)/pos.price_a, "maker": True}
-                    res_b = {"average": price_b, "qty": (pos.margin_b * LEVERAGE)/pos.price_b, "maker": True}
-                    net_pnl, net_pnl_pct = bot_state.calc_pnl(pos, res_a, res_b)
-                    if net_pnl_pct >= TARGET_NET_PNL_PCT:
+                    # 1) 진입 시 수량 복원
+                    qty_a = (pos.margin_a * LEVERAGE) / pos.price_a
+                    qty_b = (pos.margin_b * LEVERAGE) / pos.price_b
+
+                    # 2) 방향별 가상 Gross PnL (부호 직접 적용, abs 금지!)
+                    if pos.side == "LONG_A_SHORT_B":
+                        # A: Long → 현재가 상승 시 이익
+                        # B: Short → 현재가 하락 시 이익
+                        pnl_a = qty_a * (price_a - pos.price_a)
+                        pnl_b = qty_b * (pos.price_b - price_b)
+                    else:  # SHORT_A_LONG_B
+                        # A: Short → 현재가 하락 시 이익
+                        # B: Long → 현재가 상승 시 이익
+                        pnl_a = qty_a * (pos.price_a - price_a)
+                        pnl_b = qty_b * (price_b - pos.price_b)
+
+                    gross_pnl = pnl_a + pnl_b
+
+                    # 3) 왕복 수수료 추산 (진입 Taker + 청산 Maker)
+                    entry_notional = (qty_a * pos.price_a) + (qty_b * pos.price_b)
+                    exit_notional  = (qty_a * price_a) + (qty_b * price_b)
+                    total_fee = (entry_notional * TAKER_FEE_RATE) + (exit_notional * MAKER_FEE_RATE)
+
+                    # 4) 순수익 = Gross - 수수료
+                    unrealized_net = gross_pnl - total_fee
+                    total_margin   = pos.margin_a + pos.margin_b
+                    unrealized_pct = (unrealized_net / total_margin * 100) if total_margin > 0 else 0.0
+
+                    # 5) 양수 순수익이 목표치 이상일 때만 익절 (절대값 금지!)
+                    if unrealized_pct >= TARGET_NET_PNL_PCT:
                         logger.info(
-                            f"[{prefix}] 목표 순수익 도달! Net PnL={net_pnl:+.4f} USDT "
-                            f"({net_pnl_pct:+.2f}% >= {TARGET_NET_PNL_PCT}%)"
+                            f"[{prefix}] 목표 순수익 도달! "
+                            f"pnl_A={pnl_a:+.4f} pnl_B={pnl_b:+.4f} "
+                            f"gross={gross_pnl:+.4f} fee={total_fee:.4f} "
+                            f"net={unrealized_net:+.4f} USDT ({unrealized_pct:+.2f}%)"
                         )
                         await _execute_close(
                             prefix, "TAKE_PROFIT", price_a, price_b,
