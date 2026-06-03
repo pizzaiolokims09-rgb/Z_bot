@@ -745,9 +745,15 @@ async def pair_loop(
                             if contracts == 0:
                                 continue
                             raw_upnl = float(p.get("unrealizedPnl", 0.0))
-                            if sym == sym_a:
+                            
+                            # ccxt는 선물 심볼을 "RENDER/USDT:USDT" 형태로 반환하므로 ":USDT" 등을 제거하고 비교
+                            base_sym = sym.split(':')[0]
+                            base_sym_a = sym_a.split(':')[0]
+                            base_sym_b = sym_b.split(':')[0]
+                            
+                            if base_sym == base_sym_a:
                                 upnl_a = raw_upnl
-                            elif sym == sym_b:
+                            elif base_sym == base_sym_b:
                                 upnl_b = raw_upnl
 
                         # 두 레그 합산 미실현 Gross PnL (거래소 실체결가 기준)
