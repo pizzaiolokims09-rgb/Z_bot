@@ -729,67 +729,74 @@ async def pair_loop(
                                 continue
 
                 # ── Net PnL % 기반 하이브리드 익절 (Z-Score 무관) ──
-                # calc_pnl()에 의존하지 않고, 방향별 부호를 직접 계산
+                # 거래소 fetch_positions의 unrealizedPnl 사용 (실체결가 기준, 슬리피지 반영)
                 pos = bot_state.positions.get(prefix)
                 if pos and signal not in ("STOP", "EXIT"):
-                    # 1) 진입 시 수량 복원
-                    qty_a = (pos.margin_a * LEVERAGE) / pos.price_a
-                    qty_b = (pos.margin_b * LEVERAGE) / pos.price_b
-
-                    # 2) 방향별 가상 Gross PnL (부호 직접 적용, abs 금지!)
-                    if pos.side == "LONG_A_SHORT_B":
-                        # A: Long → 현재가 상승 시 이익
-                        # B: Short → 현재가 하락 시 이익
-                        pnl_a = qty_a * (price_a - pos.price_a)
-                        pnl_b = qty_b * (pos.price_b - price_b)
-                    else:  # SHORT_A_LONG_B
-                        # A: Short → 현재가 하락 시 이익
-                        # B: Long → 현재가 상승 시 이익
-                        pnl_a = qty_a * (pos.price_a - price_a)
-                        pnl_b = qty_b * (price_b - pos.price_b)
-
-                    gross_pnl = pnl_a + pnl_b
-
-                    # 3) 왕복 수수료 추산 (진입 Taker + 청산 Maker)
-                    entry_notional = (qty_a * pos.price_a) + (qty_b * pos.price_b)
-                    exit_notional  = (qty_a * price_a) + (qty_b * price_b)
-                    total_fee = (entry_notional * TAKER_FEE_RATE) + (exit_notional * MAKER_FEE_RATE)
-
-                    # 4) 순수익 = Gross - 수수료
-                    unrealized_net = gross_pnl - total_fee
-                    total_margin   = pos.margin_a + pos.margin_b
-                    unrealized_pct = (unrealized_net / total_margin * 100) if total_margin > 0 else 0.0
-
-                    # 5) 양수 순수익이 목표치 이상일 때만 익절 (절대값 금지!)
-                    if unrealized_pct >= TARGET_NET_PNL_PCT:
-                        logger.info(
-                            f"[{prefix}] 목표 순수익 도달! "
-                            f"pnl_A={pnl_a:+.4f} pnl_B={pnl_b:+.4f} "
-                            f"gross={gross_pnl:+.4f} fee={total_fee:.4f} "
-                            f"net={unrealized_net:+.4f} USDT ({unrealized_pct:+.2f}%)"
+                    try:
+                        # 거래소에서 두 레그의 미실현 PnL 직접 조회
+                        positions_raw = await asyncio.get_running_loop().run_in_executor(
+                            None, lambda: exchange.fetch_positions([sym_a, sym_b])
                         )
-                        await _execute_close(
-                            prefix, "TAKE_PROFIT", price_a, price_b,
-                            sym_a, sym_b, risk_manager, order_executor,
-                            bot_state, notifier, logger, dev,
-                            z_score=state["z_score"],
-                            close_reason=f"목표 순수익(+{TARGET_NET_PNL_PCT}%) 도달 익절",
-                        )
-                        entry_timestamp = 0.0
-                        # 청산 직후 pending_swap 바통 터치
-                        if prefix in bot_state.pending_swaps:
-                            new_a, new_b = bot_state.pending_swaps.pop(prefix)
-                            new_prefix = make_prefix(new_a, new_b)
-                            _swap_pair_in_list(prefix, new_a, new_b)
-                            await save_state(bot_state)
-                            await notifier._send(f"🔄 [{prefix}] → [{new_prefix}] 바통 터치! 새 페어 워밍업 시작")
-                            asyncio.create_task(
-                                pair_loop(new_a, new_b, exchange, order_executor, bot_state, notifier, entry_lock)
+                        upnl_a = 0.0
+                        upnl_b = 0.0
+                        for p in positions_raw:
+                            sym = p.get("symbol", "")
+                            contracts = abs(float(p.get("contracts", 0)))
+                            if contracts == 0:
+                                continue
+                            raw_upnl = float(p.get("unrealizedPnl", 0.0))
+                            if sym == sym_a:
+                                upnl_a = raw_upnl
+                            elif sym == sym_b:
+                                upnl_b = raw_upnl
+
+                        # 두 레그 합산 미실현 Gross PnL (거래소 실체결가 기준)
+                        gross_pnl = upnl_a + upnl_b
+
+                        # 왕복 수수료 추산 (진입 Taker + 청산 Maker)
+                        qty_a = (pos.margin_a * LEVERAGE) / pos.price_a
+                        qty_b = (pos.margin_b * LEVERAGE) / pos.price_b
+                        entry_notional = (qty_a * pos.price_a) + (qty_b * pos.price_b)
+                        exit_notional  = (qty_a * price_a) + (qty_b * price_b)
+                        total_fee = (entry_notional * TAKER_FEE_RATE) + (exit_notional * MAKER_FEE_RATE)
+
+                        # 순수익 = Gross PnL - 왕복 수수료
+                        unrealized_net = gross_pnl - total_fee
+                        total_margin   = pos.margin_a + pos.margin_b
+                        unrealized_pct = (unrealized_net / total_margin * 100) if total_margin > 0 else 0.0
+
+                        # 양수 순수익이 목표치 이상일 때만 익절 (절대값 금지!)
+                        if unrealized_pct >= TARGET_NET_PNL_PCT:
+                            logger.info(
+                                f"[{prefix}] 목표 순수익 도달! "
+                                f"upnl_A={upnl_a:+.4f} upnl_B={upnl_b:+.4f} "
+                                f"gross={gross_pnl:+.4f} fee={total_fee:.4f} "
+                                f"net={unrealized_net:+.4f} USDT ({unrealized_pct:+.2f}%)"
                             )
-                            logger.info(f"[PendingSwap] {prefix} → {new_prefix} 교체 완료, 이 루프 종료")
-                            return
-                        await asyncio.sleep(POLL_INTERVAL_SEC)
-                        continue
+                            await _execute_close(
+                                prefix, "TAKE_PROFIT", price_a, price_b,
+                                sym_a, sym_b, risk_manager, order_executor,
+                                bot_state, notifier, logger, dev,
+                                z_score=state["z_score"],
+                                close_reason=f"목표 순수익(+{TARGET_NET_PNL_PCT}%) 도달 익절",
+                            )
+                            entry_timestamp = 0.0
+                            # 청산 직후 pending_swap 바통 터치
+                            if prefix in bot_state.pending_swaps:
+                                new_a, new_b = bot_state.pending_swaps.pop(prefix)
+                                new_prefix = make_prefix(new_a, new_b)
+                                _swap_pair_in_list(prefix, new_a, new_b)
+                                await save_state(bot_state)
+                                await notifier._send(f"🔄 [{prefix}] → [{new_prefix}] 바통 터치! 새 페어 워밍업 시작")
+                                asyncio.create_task(
+                                    pair_loop(new_a, new_b, exchange, order_executor, bot_state, notifier, entry_lock)
+                                )
+                                logger.info(f"[PendingSwap] {prefix} → {new_prefix} 교체 완료, 이 루프 종료")
+                                return
+                            await asyncio.sleep(POLL_INTERVAL_SEC)
+                            continue
+                    except Exception as e:
+                        logger.debug(f"[{prefix}] 미실현PnL 조회 실패 (스킵): {e}")
 
                 # ── Z-Score Zero-Cross 익절 안전장치 (급등락 대비 보완) ──
                 # Z-Score가 0을 완전히 관통해서 반대편으로 가버린 경우 강제 익절 처리
