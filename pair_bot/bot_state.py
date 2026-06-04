@@ -60,6 +60,9 @@ class BotState:
         # 최신 가격        {prefix: (price_a, price_b)}
         self.latest_price: Dict[str, Tuple[float, float]] = {}
 
+        # 전체 티커 캐시 (Dual Loop 아키텍처용) {symbol: ticker_dict}
+        self.global_tickers: Dict[str, dict] = {}
+
         # 텔레그램 '수동 청산' 요청 집합 — pair_loop가 다음 틱에 처리
         self.manual_close_requests: Set[str] = set()
 

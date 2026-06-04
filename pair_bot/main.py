@@ -377,8 +377,8 @@ async def prefetch_warmup_data(exchange: ccxt_async.Exchange, sym_a: str, sym_b:
             price_a = ohlcv_a[i][4]
             price_b = ohlcv_b[i][4]
             if price_b > 0:
-                # 1분(60초) = 10초 폴링 * 6회 반복 삽입으로 가중치 맞춤
-                for _ in range(6):
+                # 1분(60초) = 3초 폴링 * 20회 반복 삽입으로 가중치 맞춤
+                for _ in range(20):
                     spread_engine.update(price_a, price_b)
                     
         logger.info(f"[{prefix}] 과거 데이터 {min_len}분치 로드 완료 (window={spread_engine.window_size}) -> 즉시 거래 가능!")
@@ -418,8 +418,23 @@ def calc_pearson_corr(prices_a: deque, prices_b: deque) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 단일 페어 감시 루프 (Z-Score / 진입 / 청산 핵심 로직 유지)
+# 전체 티커 캐싱 루프 (Dual Loop 아키텍처)
 # ─────────────────────────────────────────────────────────────────────────────
+async def global_ticker_loop(exchange: ccxt_async.Exchange, bot_state: BotState):
+    logger = logging.getLogger("pair_bot")
+    logger.info(f"Global Ticker Loop 시작 (주기: {POLL_INTERVAL_SEC}초)")
+    while True:
+        try:
+            tickers = await exchange.fetch_tickers()
+            if tickers:
+                bot_state.global_tickers = tickers
+        except Exception as e:
+            logger.warning(f"[GlobalTicker] 티커 조회 실패: {e}")
+        await asyncio.sleep(POLL_INTERVAL_SEC)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 단일 페어 감시 루프
 async def pair_loop(
     raw_sym_a: str,
     raw_sym_b: str,
@@ -448,7 +463,8 @@ async def pair_loop(
     # ── 스마트 손절용: 1분봉 종가 히스토리 (피어슨 상관계수 계산) ──
     corr_prices_a: deque = deque(maxlen=CORR_WINDOW_MIN)  # 최근 60분 A코인 종가
     corr_prices_b: deque = deque(maxlen=CORR_WINDOW_MIN)  # 최근 60분 B코인 종가
-    corr_sample_counter = 0  # 10초 폴링을 1분 단위로 다운샘플링하기 위한 카운터
+    corr_sample_counter = 0  # 3초 폴링을 1분 단위로 다운샘플링하기 위한 카운터
+    last_pnl_fetch_time = 0.0  # 초기 1회는 즉시 조회하도록 0으로 설정
 
     # ── 봇 상태(bot_state)에서 기존 포지션 복구 ──
     if prefix in bot_state.positions:
@@ -503,23 +519,28 @@ async def pair_loop(
                 await asyncio.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            # ── 1. 가격 조회 ────────────────────────────────────────────────
-            price_a, price_b = await asyncio.gather(
-                fetch_mid_price(exchange, sym_a),
-                fetch_mid_price(exchange, sym_b),
-            )
-
+            # ── 1. 가격 조회 (Global Ticker 캐시 사용) ─────────────────────────
+            ticker_a = bot_state.global_tickers.get(sym_a)
+            ticker_b = bot_state.global_tickers.get(sym_b)
+            
+            if not ticker_a or not ticker_b or not ticker_a.get('last') or not ticker_b.get('last'):
+                # 아직 캐시가 안 차오른 경우 대기
+                await asyncio.sleep(POLL_INTERVAL_SEC)
+                continue
+                
+            price_a = float(ticker_a['last'])
+            price_b = float(ticker_b['last'])
+            
             if math.isnan(price_a) or math.isnan(price_b) or price_b == 0:
-                logger.warning(f"[{prefix}] 가격 조회 실패 — 다음 사이클 대기")
                 await asyncio.sleep(POLL_INTERVAL_SEC)
                 continue
 
             # 공유 상태 업데이트 (텔레그램 Status 명령에서 사용)
             bot_state.latest_price[prefix] = (price_a, price_b)
 
-            # ── 스마트 손절용: 1분 단위 가격 샘플링 (10초 폴링 x 6 = 1분) ──
+            # ── 스마트 손절용: 1분 단위 가격 샘플링 (3초 폴링 x 20 = 1분) ──
             corr_sample_counter += 1
-            if corr_sample_counter >= 6:
+            if corr_sample_counter >= 20:
                 corr_sample_counter = 0
                 corr_prices_a.append(price_a)
                 corr_prices_b.append(price_b)
@@ -787,35 +808,41 @@ async def pair_loop(
                     gross_pnl = 0.0
                     total_fee = 0.0
                     unrealized_net = 0.0
-                    try:
-                        positions_raw = await exchange.fetch_positions()
-                        upnl_a = 0.0
-                        upnl_b = 0.0
-                        for p in positions_raw:
-                            sym = p.get("symbol", "")
-                            contracts = abs(float(p.get("contracts", 0)))
-                            if contracts == 0:
-                                continue
-                            raw_upnl = float(p.get("unrealizedPnl", 0.0))
-                            base_sym = sym.split(':')[0]
-                            if base_sym == sym_a.split(':')[0]:
-                                upnl_a = raw_upnl
-                            elif base_sym == sym_b.split(':')[0]:
-                                upnl_b = raw_upnl
+                    
+                    now = time.time()
+                    if now - last_pnl_fetch_time >= 15.0:
+                        try:
+                            positions_raw = await exchange.fetch_positions()
+                            upnl_a = 0.0
+                            upnl_b = 0.0
+                            for p in positions_raw:
+                                sym = p.get("symbol", "")
+                                contracts = abs(float(p.get("contracts", 0)))
+                                if contracts == 0:
+                                    continue
+                                raw_upnl = float(p.get("unrealizedPnl", 0.0))
+                                base_sym = sym.split(':')[0]
+                                if base_sym == sym_a.split(':')[0]:
+                                    upnl_a = raw_upnl
+                                elif base_sym == sym_b.split(':')[0]:
+                                    upnl_b = raw_upnl
 
-                        gross_pnl = upnl_a + upnl_b
-                        qty_a = (pos.margin_a * LEVERAGE) / pos.price_a
-                        qty_b = (pos.margin_b * LEVERAGE) / pos.price_b
-                        entry_notional = (qty_a * pos.price_a) + (qty_b * pos.price_b)
-                        exit_notional  = (qty_a * price_a) + (qty_b * price_b)
-                        total_fee = (entry_notional * TAKER_FEE_RATE) + (exit_notional * MAKER_FEE_RATE)
-                        unrealized_net = gross_pnl - total_fee
-                        total_margin   = pos.margin_a + pos.margin_b
-                        unrealized_pct = (unrealized_net / total_margin * 100) if total_margin > 0 else 0.0
-                        pnl_calc_ok = True
-                    except Exception as e:
-                        logger.warning(f"[{prefix}] 거래소 PnL 조회 실패 → 자체 수식 Fallback 발동: {e}")
-                        # ── Fallback: 호가 기반 자체 PnL 계산 (방어막 사수) ──
+                            gross_pnl = upnl_a + upnl_b
+                            qty_a = (pos.margin_a * LEVERAGE) / pos.price_a
+                            qty_b = (pos.margin_b * LEVERAGE) / pos.price_b
+                            entry_notional = (qty_a * pos.price_a) + (qty_b * pos.price_b)
+                            exit_notional  = (qty_a * price_a) + (qty_b * price_b)
+                            total_fee = (entry_notional * TAKER_FEE_RATE) + (exit_notional * MAKER_FEE_RATE)
+                            unrealized_net = gross_pnl - total_fee
+                            total_margin   = pos.margin_a + pos.margin_b
+                            unrealized_pct = (unrealized_net / total_margin * 100) if total_margin > 0 else 0.0
+                            pnl_calc_ok = True
+                            last_pnl_fetch_time = now
+                        except Exception as e:
+                            logger.warning(f"[{prefix}] 거래소 PnL 조회 실패 → 자체 수식 Fallback 발동: {e}")
+
+                    if not pnl_calc_ok:
+                        # 15초 쿨타임 중이거나 API 실패 시: 자체 수식 Fallback 발동 (API Weight 절감)
                         try:
                             fb_gross, _ = bot_state.calc_gross_pnl(pos, price_a, price_b, LEVERAGE)
                             fb_qty_a = (pos.margin_a * LEVERAGE) / pos.price_a
@@ -827,7 +854,8 @@ async def pair_loop(
                             total_margin   = pos.margin_a + pos.margin_b
                             unrealized_pct = (unrealized_net / total_margin * 100) if total_margin > 0 else 0.0
                             pnl_calc_ok = True
-                            logger.info(
+                            # logger를 debug로 낮추어 3초마다 로그 도배되는 것을 방지합니다.
+                            logger.debug(
                                 f"[{prefix}] Fallback PnL: gross={fb_gross:+.4f} "
                                 f"fee={fb_total_fee:.4f} net={unrealized_net:+.4f} USDT ({unrealized_pct:+.2f}%)"
                             )
@@ -1177,6 +1205,7 @@ async def main_loop():
                 pair_loop(sym_a, sym_b, exchange, order_executor, bot_state, notifier, entry_lock)
             )
 
+    tasks.append(global_ticker_loop(exchange, bot_state))
     tasks.append(btc_turbulence_monitor(exchange, bot_state, notifier))
 
     try:

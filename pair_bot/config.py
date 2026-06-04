@@ -72,11 +72,11 @@ PAPER_INITIAL_BALANCE = 1000.0
 
 # ── 듀얼 윈도우 스프레드/Z-Score 엔진 설정 ───────────────────────────────────
 # Window A (스윙 타점): 24시간 — 묵직한 펀더멘털 괴리 사냥
-RATIO_WINDOW_SWING = 8640    # 10초 폴링 x 8640 = 24시간
+RATIO_WINDOW_SWING = 28800   # 3초 폴링 x 28800 = 24시간
 ENTRY_Z_SCORE_SWING = 2.5   # |Z| >= 2.5 → 스윙 진입
 
 # Window B (단기 타점): 12시간 — 급등락 순간 극단적 이격 사냥
-RATIO_WINDOW_SHORT = 4320   # 10초 폴링 x 4320 = 12시간
+RATIO_WINDOW_SHORT = 14400  # 3초 폴링 x 14400 = 12시간
 ENTRY_Z_SCORE_SHORT = 3.0   # |Z| >= 3.0 → 단기 진입
 
 # [레거시] 고정 % 기반 임계치 (하위 호환용 — 실 판단은 Z-Score 기반으로 전환됨)
@@ -136,7 +136,7 @@ MIN_WARMUP_RATIO = 0.5
 MAX_DRAWDOWN_LIMIT = -0.05
 
 # ── 폴링 간격 (초) ──────────────────────────────────────────────────────────
-POLL_INTERVAL_SEC = 10.0   # 10초 폴링 (노이즈 감소)
+POLL_INTERVAL_SEC = 3.0   # 3초 폴링 (Dual Loop 적용으로 Rate Limit 방어 & 슬리피지 최소화)
 
 # ── 주문 재시도 설정 ────────────────────────────────────────────────────────
 ORDER_RETRY_COUNT   = 3
