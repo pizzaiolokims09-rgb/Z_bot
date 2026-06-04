@@ -782,6 +782,11 @@ async def pair_loop(
                     # ── 공통: 미실현 Net PnL 계산 (거래소 unrealizedPnl 직접 조회) ──
                     unrealized_pct = 0.0
                     pnl_calc_ok = False
+                    upnl_a = 0.0
+                    upnl_b = 0.0
+                    gross_pnl = 0.0
+                    total_fee = 0.0
+                    unrealized_net = 0.0
                     try:
                         positions_raw = await exchange.fetch_positions()
                         upnl_a = 0.0
@@ -809,7 +814,25 @@ async def pair_loop(
                         unrealized_pct = (unrealized_net / total_margin * 100) if total_margin > 0 else 0.0
                         pnl_calc_ok = True
                     except Exception as e:
-                        logger.debug(f"[{prefix}] 미실현PnL 조회 실패 (스킵): {e}")
+                        logger.warning(f"[{prefix}] 거래소 PnL 조회 실패 → 자체 수식 Fallback 발동: {e}")
+                        # ── Fallback: 호가 기반 자체 PnL 계산 (방어막 사수) ──
+                        try:
+                            fb_gross, _ = bot_state.calc_gross_pnl(pos, price_a, price_b, LEVERAGE)
+                            fb_qty_a = (pos.margin_a * LEVERAGE) / pos.price_a
+                            fb_qty_b = (pos.margin_b * LEVERAGE) / pos.price_b
+                            fb_entry_notional = (fb_qty_a * pos.price_a) + (fb_qty_b * pos.price_b)
+                            fb_exit_notional  = (fb_qty_a * price_a) + (fb_qty_b * price_b)
+                            fb_total_fee = (fb_entry_notional * TAKER_FEE_RATE) + (fb_exit_notional * TAKER_FEE_RATE)
+                            unrealized_net = fb_gross - fb_total_fee
+                            total_margin   = pos.margin_a + pos.margin_b
+                            unrealized_pct = (unrealized_net / total_margin * 100) if total_margin > 0 else 0.0
+                            pnl_calc_ok = True
+                            logger.info(
+                                f"[{prefix}] Fallback PnL: gross={fb_gross:+.4f} "
+                                f"fee={fb_total_fee:.4f} net={unrealized_net:+.4f} USDT ({unrealized_pct:+.2f}%)"
+                            )
+                        except Exception as e2:
+                            logger.error(f"[{prefix}] Fallback PnL 계산도 실패 (방어막 무력화): {e2}")
 
                     # ── 공통: 상관계수 계산 ──
                     corr = calc_pearson_corr(corr_prices_a, corr_prices_b)

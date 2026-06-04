@@ -117,13 +117,15 @@ class BotState:
         수수료가 완전히 차감된 순수익(Net PnL)을 반환합니다.
 
         result_a, result_b 딕셔너리 필드:
-          - total_realized_pnl: fetch_my_trades에서 합산한 거래소 정산 실현손익 (부분체결 완전합산)
+          - total_realized_pnl: fetch_my_trades에서 합산한 거래소 정산 실현손익
           - total_fee: fetch_my_trades에서 합산한 거래소 실제 수수료
           - average, qty, maker: 가중평균가, 수량, Maker 여부
           위 필드가 None이면 실시간 감시(가상 청산) 모드 → 수학 수식 Fallback
-        
+
         반환: (net_pnl_usdt, net_pnl_pct)
         """
+        from config import LEVERAGE
+
         # 거래소 정산 값 추출 (fetch_my_trades 합산 결과)
         rpnl_a = result_a.get("total_realized_pnl")
         rpnl_b = result_b.get("total_realized_pnl")
@@ -132,54 +134,53 @@ class BotState:
 
         avg_a = result_a.get("average", 0.0)
         avg_b = result_b.get("average", 0.0)
-        
+
         # 방어 로직: 체결가가 0이면 진입가로 대체 (오류 방지)
         if avg_a == 0.0: avg_a = pos.price_a
         if avg_b == 0.0: avg_b = pos.price_b
-        
+
         qty_a = result_a.get("qty", 0.0)
         qty_b = result_b.get("qty", 0.0)
-        
-        # 방어 로직: 수량이 0이면 기존 계산식으로 대체
-        leverage = 5
-        if qty_a == 0.0: qty_a = pos.margin_a * leverage / pos.price_a
-        if qty_b == 0.0: qty_b = pos.margin_b * leverage / pos.price_b
 
-        # 1) Gross PnL 산출
+        # 방어 로직: 수량이 0이면 레버리지 기반으로 역산
+        if qty_a == 0.0: qty_a = (pos.margin_a * LEVERAGE) / pos.price_a
+        if qty_b == 0.0: qty_b = (pos.margin_b * LEVERAGE) / pos.price_b
+
+        # ── 1) Gross PnL 산출 ──
         has_exchange_pnl = (rpnl_a is not None and rpnl_b is not None)
 
         if has_exchange_pnl:
-            # 거래소 정산 값 직접 사용 (부분체결 완벽 합산, 수학 수식 없음)
+            # 거래소 정산 값 직접 사용 (부분체결 완벽 합산)
             gross = float(rpnl_a) + float(rpnl_b)
         else:
-            # 실시간 감시(가상 청산) Fallback — 수학 수식 추산
+            # 수학 수식 Fallback — Long/Short 방향 엄격 적용
+            # LONG_A_SHORT_B: A는 롱(현재가-진입가), B는 숏(진입가-현재가)
+            # SHORT_A_LONG_B: A는 숏(진입가-현재가), B는 롱(현재가-진입가)
             if pos.side == "LONG_A_SHORT_B":
-                gross = qty_a * (avg_a - pos.price_a) + qty_b * (pos.price_b - avg_b)
+                pnl_a = qty_a * (avg_a - pos.price_a)   # A 롱 손익
+                pnl_b = qty_b * (pos.price_b - avg_b)   # B 숏 손익
             else:  # SHORT_A_LONG_B
-                gross = qty_a * (pos.price_a - avg_a) + qty_b * (avg_b - pos.price_b)
+                pnl_a = qty_a * (pos.price_a - avg_a)   # A 숏 손익
+                pnl_b = qty_b * (avg_b - pos.price_b)   # B 롱 손익
+            gross = pnl_a + pnl_b
 
-        # 2) 수수료 계산
-        total_notional = (qty_a * pos.price_a) + (qty_b * pos.price_b)
-        entry_fee = total_notional * TAKER_FEE_RATE       # 진입 2회 (시장가)
+        # ── 2) 수수료 계산 ──
+        # 진입: 양 레그 모두 시장가(Taker)로 진입
+        entry_notional = (qty_a * pos.price_a) + (qty_b * pos.price_b)
+        entry_fee = entry_notional * TAKER_FEE_RATE
 
         if has_exchange_pnl and tfee_a is not None and tfee_b is not None:
             # 거래소 실제 수수료 (fetch_my_trades 합산)
             exit_fee = float(tfee_a) + float(tfee_b)
         else:
-            # Fallback: 수수료율로 추산
-            fee_a = result_a.get("fee", 0.0)
-            if fee_a == 0.0:
-                rate_a = MAKER_FEE_RATE if result_a.get("maker") else TAKER_FEE_RATE
-                fee_a = (qty_a * avg_a) * rate_a
-            fee_b = result_b.get("fee", 0.0)
-            if fee_b == 0.0:
-                rate_b = MAKER_FEE_RATE if result_b.get("maker") else TAKER_FEE_RATE
-                fee_b = (qty_b * avg_b) * rate_b
-            exit_fee = fee_a + fee_b
+            # Fallback: 청산 호가 기반으로 수수료율 추산
+            rate_a = MAKER_FEE_RATE if result_a.get("maker") else TAKER_FEE_RATE
+            rate_b = MAKER_FEE_RATE if result_b.get("maker") else TAKER_FEE_RATE
+            exit_fee = (qty_a * avg_a) * rate_a + (qty_b * avg_b) * rate_b
 
         total_fee = entry_fee + exit_fee
 
-        # 3) 최종 Net PnL 산출
+        # ── 3) 최종 Net PnL 산출 ──
         net_pnl      = gross - total_fee
         total_margin = pos.total_margin
         net_pnl_pct  = (net_pnl / total_margin * 100) if total_margin > 0 else 0.0

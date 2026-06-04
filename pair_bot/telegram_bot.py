@@ -132,7 +132,7 @@ class TelegramNotifier:
             emoji = "🔘"
         else:
             tag   = "손절"
-            desc  = "디커플링 손절"
+            desc  = close_reason if close_reason else "디커플링 손절"
             emoji = "🛑"
 
         msg = (
