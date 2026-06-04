@@ -412,7 +412,11 @@ async def prefetch_warmup_data(exchange: ccxt_async.Exchange, sym_a: str, sym_b:
                 # 1분(60초) = 3초 폴링 * 20회 반복 삽입으로 가중치 맞춤
                 for _ in range(20):
                     spread_engine.update(price_a, price_b)
-                    
+            
+            # 이벤트 루프 블로킹 방지 (텔레그램 타임아웃 방어)
+            if i % 100 == 0:
+                await asyncio.sleep(0)
+                
         logger.info(f"[{prefix}] 과거 데이터 {min_len}분치 로드 완료 (window={spread_engine.window_size}) -> 즉시 거래 가능!")
     except Exception as e:
         logger.warning(f"[{prefix}] 워밍업 데이터 로드 중 오류: {e}")
