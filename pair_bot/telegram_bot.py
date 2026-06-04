@@ -76,6 +76,10 @@ class TelegramNotifier:
         app = (
             Application.builder()
             .token(TELEGRAM_BOT_TOKEN)
+            .connect_timeout(30.0)
+            .read_timeout(30.0)
+            .write_timeout(30.0)
+            .pool_timeout(30.0)
             .build()
         )
         app.add_handler(CommandHandler(["start", "menu"], self._cmd_menu))
