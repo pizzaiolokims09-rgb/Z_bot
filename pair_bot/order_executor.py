@@ -471,7 +471,7 @@ class OrderExecutor:
             await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: self._exchange.create_order(
-                    symbol, "market", reverse_side, qty, {"reduceOnly": True}
+                    symbol, "market", reverse_side, qty, None, {"reduceOnly": True}
                 ),
             )
             logger.info(f"[{pair_prefix}] [롤백 성공] {symbol} {reverse_side} {qty:.4f}")
@@ -561,11 +561,27 @@ class OrderExecutor:
                 order = await asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda: self._exchange.create_order(
-                        symbol, "market", close_side, contracts, {"reduceOnly": True}
+                        symbol, "market", close_side, contracts, None, {"reduceOnly": True}
                     )
                 )
                 order_id = order['id']
-                logger.info(f"[{pair_prefix}] [실거래] 청산완료 id={order_id} | {symbol}")
+                logger.info(f"[{pair_prefix}] [실거래] 청산주문 id={order_id} | {symbol} {close_side} {contracts}")
+                
+                # ── 청산 후 포지션 잔량 검증 (부분 체결 방어) ──
+                await asyncio.sleep(1)
+                verify_pos_list = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: self._exchange.fetch_positions([symbol])
+                )
+                v_pos = verify_pos_list[0] if verify_pos_list else {}
+                remaining = abs(float(v_pos.get("contracts", 0)))
+                if remaining > 0:
+                    logger.warning(
+                        f"[{pair_prefix}] [부분체결] {symbol} 잔여 {remaining}개 — "
+                        f"재시도 {attempt}/{ORDER_RETRY_COUNT}"
+                    )
+                    continue  # 다음 retry에서 잔량 청산 시도
+
+                logger.info(f"[{pair_prefix}] [청산검증] {symbol} 포지션 완전 청산 확인")
                 
                 # fetch_my_trades로 모든 부분 체결의 realizedPnl과 fee를 완벽 합산
                 return await self._aggregate_trades_for_order(

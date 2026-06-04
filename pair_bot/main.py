@@ -193,15 +193,37 @@ async def _execute_close(
     # 실체결 결과를 바탕으로 Net PnL 계산
     pnl_usdt, pnl_pct = 0.0, 0.0
     if pos:
-        # results는 (result_a, result_b) 형태
-        if results and not isinstance(results[0], Exception) and not isinstance(results[1], Exception):
-            res_a, res_b = results
-        else:
-            # 에러난 경우 fallback 추산
-            logger.warning(f"[{prefix}] 청산 결과 비정상 - 요청 호가로 PnL 임시 추산")
-            res_a = {"average": price_a, "qty": (pos.margin_a * LEVERAGE)/pos.price_a, "maker": is_maker}
-            res_b = {"average": price_b, "qty": (pos.margin_b * LEVERAGE)/pos.price_b, "maker": is_maker}
+        # ── 청산 성공 여부 검증 (양쪽 레그 모두 성공해야 포지션 정리) ──
+        if not results:
+            logger.critical(
+                f"[{prefix}] 청산 결과 없음(results=None) — 포지션 유지, 다음 루프에서 재시도"
+            )
+            await notifier._send(
+                f"🚨 [{prefix}] 청산 주문 실패!\n결과 없음 — 포지션이 거래소에 남아있습니다."
+            )
+            return
 
+        a_failed = isinstance(results[0], Exception)
+        b_failed = isinstance(results[1], Exception)
+
+        if a_failed or b_failed:
+            failed_info = []
+            if a_failed:
+                failed_info.append(f"A({sym_a}): {results[0]}")
+            if b_failed:
+                failed_info.append(f"B({sym_b}): {results[1]}")
+            logger.critical(
+                f"[{prefix}] 청산 실패! {' | '.join(failed_info)} — "
+                f"포지션 유지, 다음 루프에서 재시도"
+            )
+            await notifier._send(
+                f"🚨 [{prefix}] 청산 실패!\n"
+                + "\n".join(failed_info)
+                + "\n포지션이 거래소에 남아있습니다. 수동 확인 필요!"
+            )
+            return  # ★ 핵심: 포지션 pop 하지 않음 → 다음 루프에서 재시도
+
+        res_a, res_b = results
         pnl_usdt, pnl_pct = bot_state.calc_pnl(pos, res_a, res_b)
         bot_state.record_trade(pnl_usdt)
         bot_state.positions.pop(prefix, None)
@@ -814,7 +836,12 @@ async def pair_loop(
                     now = time.time()
                     if now - last_pnl_fetch_time >= 15.0:
                         try:
-                            positions_raw = await exchange.fetch_positions()
+                            if IS_PAPER_TRADING:
+                                raise Exception("Paper Trading Mode (API 스킵)")
+
+                            positions_raw = await asyncio.get_running_loop().run_in_executor(
+                                None, order_executor._exchange.fetch_positions
+                            )
                             upnl_a = 0.0
                             upnl_b = 0.0
                             for p in positions_raw:

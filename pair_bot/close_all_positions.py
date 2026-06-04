@@ -1,7 +1,7 @@
 # =============================================================================
 # close_all_positions.py
-# 현재 바이낸스 선물 계좌의 모든 열린 포지션을 시장가로 청산하는 1회용 스크립트
-# 실행 후 bot_state.json의 포지션도 비워줍니다.
+# 바이낸스 데모(테스트넷) 선물 계좌의 모든 열린 포지션을 지정가로 청산
+# 시장가 주문이 안 되는 테스트넷 환경 대응
 # =============================================================================
 
 import asyncio
@@ -22,34 +22,91 @@ async def main():
         "options": {"defaultType": "future", "adjustForTimeDifference": True},
         "enableRateLimit": True,
     })
-    # 데모(Testnet) 모드 활성화
-    exchange.set_sandbox_mode(True)
+    exchange.enable_demo_trading(True)
 
     try:
-        # 모든 포지션 조회
+        # 1) 기존 미체결 주문 전부 취소
+        print("--- 기존 미체결 주문 취소 중 ---")
+        try:
+            open_orders = await exchange.fetch_open_orders()
+            for o in open_orders:
+                try:
+                    await exchange.cancel_order(o["id"], o["symbol"])
+                    print(f"  취소: {o['symbol']} id={o['id']}")
+                except Exception as e:
+                    print(f"  취소 실패: {o['symbol']} {e}")
+        except Exception as e:
+            print(f"  미체결 주문 조회 실패: {e}")
+
+        await asyncio.sleep(1)
+
+        # 2) 모든 포지션 조회
         positions = await exchange.fetch_positions()
         open_positions = [p for p in positions if abs(float(p["info"]["positionAmt"])) > 0]
 
         if not open_positions:
             print("열린 포지션이 없습니다.")
         else:
-            print(f"--- {len(open_positions)}개 포지션 청산 시작 ---")
+            print(f"\n--- {len(open_positions)}개 포지션 청산 시작 ---")
             for pos in open_positions:
                 sym = pos["symbol"]
                 amt = float(pos["info"]["positionAmt"])
                 close_side = "buy" if amt < 0 else "sell"
                 close_qty = abs(amt)
+                mark_price = float(pos.get("markPrice", 0) or pos.get("info", {}).get("markPrice", 0))
 
-                print(f"  청산: {sym} | 수량={close_qty} | 방향={close_side.upper()}")
+                print(f"\n  [{sym}] 수량={amt} | 청산방향={close_side.upper()} | markPrice={mark_price}")
+
+                # 오더북에서 최우선 호가 조회
                 try:
-                    await exchange.create_order(
-                        sym, "market", close_side, close_qty, {"reduceOnly": True}
-                    )
-                    print(f"  -> {sym} 청산 완료")
-                except Exception as e:
-                    print(f"  -> {sym} 청산 실패: {e}")
+                    ob = await exchange.fetch_order_book(sym, 5)
+                    if close_side == "sell":
+                        # Long 청산 → Best Bid에 팔기
+                        limit_price = ob["bids"][0][0] if ob.get("bids") and ob["bids"] else mark_price
+                    else:
+                        # Short 청산 → Best Ask에 사기
+                        limit_price = ob["asks"][0][0] if ob.get("asks") and ob["asks"] else mark_price
+                except Exception:
+                    limit_price = mark_price
 
-        # bot_state.json 포지션 비우기
+                if limit_price <= 0:
+                    print(f"  -> {sym} 유효한 가격 없음, 스킵")
+                    continue
+
+                print(f"  -> 지정가 {close_side.upper()} {close_qty} @ {limit_price}")
+                try:
+                    order = await exchange.create_order(
+                        sym, "limit", close_side, close_qty, limit_price,
+                        {"reduceOnly": True, "timeInForce": "GTC"}
+                    )
+                    print(f"  -> 주문 접수 id={order['id']}")
+                except Exception as e:
+                    print(f"  -> 지정가 실패: {e}")
+                    # Fallback: reduceOnly 없이 시도
+                    try:
+                        print(f"  -> reduceOnly 없이 재시도...")
+                        order = await exchange.create_order(
+                            sym, "limit", close_side, close_qty, limit_price,
+                            {"timeInForce": "GTC"}
+                        )
+                        print(f"  -> 주문 접수 id={order['id']}")
+                    except Exception as e2:
+                        print(f"  -> 최종 실패: {e2}")
+
+            # 3) 체결 대기 (최대 30초)
+            print("\n--- 체결 대기 중 (30초) ---")
+            for sec in range(30):
+                await asyncio.sleep(1)
+                remaining = await exchange.fetch_positions()
+                still_open = [p for p in remaining if abs(float(p["info"]["positionAmt"])) > 0]
+                if not still_open:
+                    print(f"  {sec+1}초 후 전체 청산 확인!")
+                    break
+                if (sec + 1) % 5 == 0:
+                    syms = [p["symbol"] for p in still_open]
+                    print(f"  {sec+1}초... 잔여: {syms}")
+
+        # 4) bot_state.json 포지션 비우기
         state_file = "bot_state.json"
         if os.path.exists(state_file):
             with open(state_file, "r", encoding="utf-8") as f:
