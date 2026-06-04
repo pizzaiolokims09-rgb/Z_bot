@@ -590,6 +590,26 @@ async def pair_loop(
                     await asyncio.sleep(POLL_INTERVAL_SEC)
                     continue
 
+                # ── 1단계 슬롯/쿨다운 사전 검증 (조건 미달 시 30초 필터 시작 안 함) ──
+                # 손절 후 재진입 쿨다운
+                elapsed = time.time() - bot_state.cooldowns.get(prefix, 0.0)
+                if elapsed < STOP_LOSS_COOLDOWN_SEC:
+                    entry_confirm_ts = 0.0
+                    await asyncio.sleep(POLL_INTERVAL_SEC)
+                    continue
+
+                # 일일 손절 횟수 제한
+                if bot_state.daily_stop_counts.get(prefix, 0) >= MAX_STOP_LOSS_PER_PAIR:
+                    entry_confirm_ts = 0.0
+                    await asyncio.sleep(POLL_INTERVAL_SEC)
+                    continue
+
+                # 활성 슬롯 체크 (미리 검사)
+                if len(bot_state.positions) >= MAX_ACTIVE_PAIRS:
+                    entry_confirm_ts = 0.0
+                    await asyncio.sleep(POLL_INTERVAL_SEC)
+                    continue
+
                 # ── 30초 확인 매매 필터 (Whipsaw Prevention) ──────────────────
                 now_ts = time.time()
                 if entry_confirm_ts == 0.0:
@@ -619,25 +639,7 @@ async def pair_loop(
                 )
                 entry_confirm_ts = 0.0
 
-                # 손절 후 재진입 쿨다운 (진입→손절 무한루프 방지)
-                elapsed = time.time() - bot_state.cooldowns.get(prefix, 0.0)
-                if elapsed < STOP_LOSS_COOLDOWN_SEC:
-                    remaining = int(STOP_LOSS_COOLDOWN_SEC - elapsed)
-                    logger.debug(
-                        f"[{prefix}] 손절 쿨다운 중 — 재진입까지 {remaining}초 남음"
-                    )
-                    await asyncio.sleep(POLL_INTERVAL_SEC)
-                    continue
-
-                # 일일 손절 횟수 제한 (한 페어에서 연속 손실 방지)
-                if bot_state.daily_stop_counts.get(prefix, 0) >= MAX_STOP_LOSS_PER_PAIR:
-                    logger.debug(
-                        f"[{prefix}] 일일 손절 한도 도달 ({bot_state.daily_stop_counts.get(prefix, 0)}/{MAX_STOP_LOSS_PER_PAIR}) — 당일 진입 중단"
-                    )
-                    await asyncio.sleep(POLL_INTERVAL_SEC)
-                    continue
-
-                # 1단계 슬롯 체크 (락 가볍게 획득 후 바로 해제)
+                # 2단계 슬롯 체크 (30초 대기 중 다른 페어가 진입했을 수 있으므로 락 걸고 최종 확인)
                 should_skip = False
                 async with entry_lock:
                     if len(bot_state.positions) >= MAX_ACTIVE_PAIRS:
