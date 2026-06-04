@@ -558,12 +558,31 @@ class OrderExecutor:
                     amt = float(pos.get("info", {}).get("positionAmt", 0))
                     close_side = "sell" if amt > 0 else "buy"
                     
-                order = await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    lambda: self._exchange.create_order(
-                        symbol, "market", close_side, contracts, None, {"reduceOnly": True}
+                try:
+                    order = await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        lambda: self._exchange.create_order(
+                            symbol, "market", close_side, contracts, None, {"reduceOnly": True}
+                        )
                     )
-                )
+                except Exception as me:
+                    if "-4131" in str(me) or "PERCENT_PRICE" in str(me):
+                        logger.warning(f"[{pair_prefix}] 시장가 불가능(-4131). MarkPrice ±1% IOC 지정가로 폴백: {symbol}")
+                        mark_price = float(pos.get("markPrice", 0) or pos.get("info", {}).get("markPrice", 0))
+                        if mark_price <= 0:
+                            raise me
+                        # PERCENT_PRICE 필터(보통 5%)를 피하기 위해 Mark Price의 1% 내외로 제한
+                        limit_price = mark_price * 1.01 if close_side == "buy" else mark_price * 0.99
+                        order = await asyncio.get_running_loop().run_in_executor(
+                            None,
+                            lambda: self._exchange.create_order(
+                                symbol, "limit", close_side, contracts, limit_price, 
+                                {"reduceOnly": True, "timeInForce": "IOC"}
+                            )
+                        )
+                    else:
+                        raise me
+
                 order_id = order['id']
                 logger.info(f"[{pair_prefix}] [실거래] 청산주문 id={order_id} | {symbol} {close_side} {contracts}")
                 

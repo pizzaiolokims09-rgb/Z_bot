@@ -212,15 +212,25 @@ async def _execute_close(
                 failed_info.append(f"A({sym_a}): {results[0]}")
             if b_failed:
                 failed_info.append(f"B({sym_b}): {results[1]}")
-            logger.critical(
-                f"[{prefix}] 청산 실패! {' | '.join(failed_info)} — "
-                f"포지션 유지, 다음 루프에서 재시도"
-            )
-            await notifier._send(
-                f"🚨 [{prefix}] 청산 실패!\n"
-                + "\n".join(failed_info)
-                + "\n포지션이 거래소에 남아있습니다. 수동 확인 필요!"
-            )
+            
+            # 알림 스팸 방지: 페어당 60초에 한 번만 텔레그램 발송
+            import time
+            now = time.time()
+            if not hasattr(bot_state, "last_error_alerts"):
+                bot_state.last_error_alerts = {}
+            
+            last_alert = bot_state.last_error_alerts.get(prefix, 0)
+            if now - last_alert > 60:
+                logger.critical(
+                    f"[{prefix}] 청산 실패! {' | '.join(failed_info)} — "
+                    f"포지션 유지, 다음 루프에서 재시도"
+                )
+                await notifier._send(
+                    f"🚨 [{prefix}] 청산 실패!\n"
+                    + "\n".join(failed_info)
+                    + "\n포지션이 거래소에 남아있습니다. 수동 확인 필요!"
+                )
+                bot_state.last_error_alerts[prefix] = now
             return  # ★ 핵심: 포지션 pop 하지 않음 → 다음 루프에서 재시도
 
         res_a, res_b = results
