@@ -233,9 +233,15 @@ class SpreadEngine:
         short_triggered = abs_z_sh >= ENTRY_Z_SCORE_SHORT
 
         if swing_triggered or short_triggered:
-            # 진입 방향 결정 (스윙 Z-Score 기준)
-            entry_win = "swing" if swing_triggered else "short"
-            if z_swing > 0:
+            # 진입 방향 결정 (트리거된 윈도우의 Z-Score 부호 기준)
+            if swing_triggered:
+                entry_win = "swing"
+                z_for_dir = z_swing
+            else:
+                entry_win = "short"
+                z_for_dir = z_short
+
+            if z_for_dir > 0:
                 return "ENTRY_SHORT_A_LONG_B", entry_win
             else:
                 return "ENTRY_LONG_A_SHORT_B", entry_win
