@@ -207,19 +207,11 @@ class SpreadEngine:
         if not ready:
             return "NONE", ""
 
-        abs_z_sw  = abs(z_swing)
-        abs_z_sh  = abs(z_short)
-        abs_dev   = abs(dev_pct)
+        abs_z_sw = abs(z_swing)
+        abs_z_sh = abs(z_short)
+        abs_dev = abs(dev_pct)
 
-        # 1순위: 손절 (스윙 기준)
-        if abs_z_sw >= STOP_LOSS_Z_SCORE:
-            return "STOP", ""
-
-        # 2순위: 청산 회귀 (스윙 기준 Z-Score가 0 부근으로 돌아옴)
-        if abs_z_sw <= EXIT_Z_SCORE:
-            return "EXIT", ""
-
-        # 3순위: 진입 — 듀얼 윈도우 OR 조건 + 추세 필터
+        # 1순위: 진입 — 듀얼 윈도우 OR 조건 + 추세 필터
         if is_trending:
             return "NONE", ""  # 추세 중이면 진입하지 않음
 

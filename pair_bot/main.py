@@ -592,10 +592,11 @@ async def pair_loop(
 
             # 주기적 상태 로그 (60초마다 DEBUG → bot.log에 기록)
             if int(time.time()) % 60 == 0:
-                pnl_est = (
-                    risk_manager.estimate_pnl_pct(ratio)
-                    if risk_manager.has_position else 0.0
-                )
+                if risk_manager.has_position and prefix in bot_state.positions:
+                    pos_ = bot_state.positions[prefix]
+                    _, pnl_est = bot_state.calc_gross_pnl(pos_, price_a, price_b, LEVERAGE)
+                else:
+                    pnl_est = 0.0
                 logger.debug(
                     f"[{prefix}] ratio={ratio:.6f} | dev={dev:+.3f}% | "
                     f"zSw={state['z_score_swing']:+.3f} zSh={state['z_score_short']:+.3f} | "
