@@ -1027,11 +1027,12 @@ async def pair_loop(
                             signal = "EXIT"
 
                         if signal == "EXIT":
-                            res_a = {"average": price_a, "qty": (pos.margin_a * LEVERAGE)/pos.price_a, "maker": True}
-                            res_b = {"average": price_b, "qty": (pos.margin_b * LEVERAGE)/pos.price_b, "maker": True}
-                            net_pnl, _ = bot_state.calc_pnl(pos, res_a, res_b)
-                            if net_pnl <= 0:
-                                logger.debug(f"[{prefix}] EXIT 시그널 무시 — Net PnL={net_pnl:+.4f} USDT (수수료 미충당)")
+                            # 슬리피지 방어: 실시간 unrealized_pct가 +0.5% 이상일 때만 청산
+                            if not pnl_calc_ok or unrealized_pct < 0.5:
+                                logger.debug(
+                                    f"[{prefix}] EXIT 시그널 무시 — "
+                                    f"unrealized={unrealized_pct:+.2f}% < +0.5% (슬리피지 방어 홀딩)"
+                                )
                                 await asyncio.sleep(POLL_INTERVAL_SEC)
                                 continue
                             await _execute_close(
