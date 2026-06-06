@@ -93,14 +93,32 @@ class BotState:
         # None이면 config.py 기본값 사용, 리스트가 있으면 덮어쓰기
         self.active_pairs_override: list | None = None
 
+        # 페어별 누적 승/패 통계 {prefix: {"win": N, "lose": N}}
+        self.pair_stats: Dict[str, Dict[str, int]] = {}
+
+        # 최신 단기 상관계수 캐시 {prefix: corr_value}
+        self.latest_corr: Dict[str, float] = {}
+
+        # 감시 일시 정지 페어 집합 (paused → pair_loop에서 스킵)
+        self.paused_pairs: Set[str] = set()
+
     # ── 통계 헬퍼 ─────────────────────────────────────────────────────────────
 
-    def record_trade(self, pnl_usdt: float) -> None:
-        """청산 완료 시 누적 통계를 업데이트합니다."""
+    def record_trade(self, pnl_usdt: float, prefix: str = "") -> None:
+        """청산 완료 시 누적 통계와 페어별 통계를 동시에 업데이트합니다."""
         self.total_trades   += 1
         self.cumulative_pnl += pnl_usdt
         if pnl_usdt >= 0:
             self.wins += 1
+
+        # 페어별 통계 갱신
+        if prefix:
+            if prefix not in self.pair_stats:
+                self.pair_stats[prefix] = {"win": 0, "lose": 0}
+            if pnl_usdt >= 0:
+                self.pair_stats[prefix]["win"] += 1
+            else:
+                self.pair_stats[prefix]["lose"] += 1
 
     @property
     def win_rate(self) -> float:

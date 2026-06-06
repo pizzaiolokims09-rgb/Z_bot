@@ -29,6 +29,7 @@ from config import (
     TAKER_FEE_RATE, MAKER_FEE_RATE,
     ENTRY_CONFIRMATION_SEC, MAX_LOSS_PCT,
     CORR_WINDOW_MIN, CORR_STOP_THRESHOLD, STOP_LOSS_Z_SCORE,
+    ENTRY_MIN_CORRELATION,
 )
 from spread_engine      import SpreadEngine
 from risk_manager       import RiskManager
@@ -235,7 +236,7 @@ async def _execute_close(
 
         res_a, res_b = results
         pnl_usdt, pnl_pct = bot_state.calc_pnl(pos, res_a, res_b)
-        bot_state.record_trade(pnl_usdt)
+        bot_state.record_trade(pnl_usdt, prefix=prefix)
         bot_state.positions.pop(prefix, None)
 
     if reason == "STOP_LOSS":
@@ -523,6 +524,12 @@ async def pair_loop(
 
     while True:
         try:
+            # ── 감시 일시 정지(Paused) 페어 스킵 ──────────────────────────
+            # (단, 활성 포지션이 남아 있으면 청산 감시를 위해 절대 스킵하지 않음)
+            if prefix in bot_state.paused_pairs and prefix not in bot_state.positions:
+                await asyncio.sleep(10)  # 10초 간격으로 재확인 (CPU 절약)
+                continue
+
             # ── 자정 리셋 (일일 손절 카운터) ───────────────────────────────
             today_str = date.today().isoformat()
             if bot_state.daily_reset_date != today_str:
@@ -600,7 +607,7 @@ async def pair_loop(
                 logger.debug(
                     f"[{prefix}] ratio={ratio:.6f} | dev={dev:+.3f}% | "
                     f"zSw={state['z_score_swing']:+.3f} zSh={state['z_score_short']:+.3f} | "
-                    f"win={window} | slope={state['slope']:.6f} | "
+                    f"win={window} | slopeN={state['normalized_slope_pct']:.4f}% | "
                     f"trend={'Y' if state['is_trending'] else 'N'} | "
                     f"pos={'O' if risk_manager.has_position else '-'} | "
                     f"PnL={pnl_est:+.3f}% | SL={bot_state.daily_stop_counts.get(prefix, 0)}/{MAX_STOP_LOSS_PER_PAIR}"
@@ -611,7 +618,7 @@ async def pair_loop(
 
             # Z-Score가 문턱 아래로 내려가면 30초 확인 타이머 리셋
             if not signal.startswith("ENTRY") and entry_confirm_ts > 0.0:
-                logger.debug(f"[{prefix}] Z-Score 문턱 이탈 → 30초 확인 타이머 리셋")
+                logger.debug(f"[{prefix}] Z-Score 문턱 이탈 → {ENTRY_CONFIRMATION_SEC}초 확인 타이머 리셋")
                 entry_confirm_ts = 0.0
 
             if not risk_manager.has_position and signal.startswith("ENTRY"):
@@ -647,14 +654,24 @@ async def pair_loop(
                     await asyncio.sleep(POLL_INTERVAL_SEC)
                     continue
 
+                # ── 진입 상관계수 사전 검증 (디커플링 차단) ──────────────────
+                entry_corr = calc_pearson_corr(corr_prices_a, corr_prices_b)
+                if entry_corr < ENTRY_MIN_CORRELATION:
+                    entry_confirm_ts = 0.0
+                    logger.debug(
+                        f"[{prefix}] 진입 차단 — 상관계수={entry_corr:.3f} < {ENTRY_MIN_CORRELATION} (디커플링)"
+                    )
+                    await asyncio.sleep(POLL_INTERVAL_SEC)
+                    continue
+
                 # ── 30초 확인 매매 필터 (Whipsaw Prevention) ──────────────────
                 now_ts = time.time()
                 if entry_confirm_ts == 0.0:
                     # Z-Score가 진입 문턴을 처음 넘은 시점 → 타이머 시작
                     entry_confirm_ts = now_ts
                     logger.info(
-                        f"[{prefix}] 30초 확인 필터 시작 | z={state['z_score']:+.3f} | "
-                        f"신호={signal}"
+                        f"[{prefix}] {ENTRY_CONFIRMATION_SEC}초 확인 필터 시작 | z={state['z_score']:+.3f} | "
+                        f"corr={entry_corr:.3f} | 신호={signal}"
                     )
                     await asyncio.sleep(POLL_INTERVAL_SEC)
                     continue
@@ -669,10 +686,10 @@ async def pair_loop(
                     await asyncio.sleep(POLL_INTERVAL_SEC)
                     continue
 
-                # 30초 경과 → 진짜 타점으로 인정! 타이머 초기화 후 진입 진행
+                # 확인 시간 경과 → 진짜 타점으로 인정! 타이머 초기화 후 진입 진행
                 logger.info(
-                    f"[{prefix}] 30초 확인 필터 통과! | z={state['z_score']:+.3f} | "
-                    f"신호={signal} | 진입 실행"
+                    f"[{prefix}] {ENTRY_CONFIRMATION_SEC}초 확인 필터 통과! | z={state['z_score']:+.3f} | "
+                    f"corr={entry_corr:.3f} | 신호={signal} | 진입 실행"
                 )
                 entry_confirm_ts = 0.0
 
@@ -908,6 +925,7 @@ async def pair_loop(
 
                     # ── 공통: 상관계수 계산 ──
                     corr = calc_pearson_corr(corr_prices_a, corr_prices_b)
+                    bot_state.latest_corr[prefix] = corr
 
                     # ── 우선순위 1: 익절 (+3.5%) ──
                     if pnl_calc_ok and unrealized_pct >= TARGET_NET_PNL_PCT:
@@ -1027,11 +1045,12 @@ async def pair_loop(
                             signal = "EXIT"
 
                         if signal == "EXIT":
-                            # 슬리피지 방어: 실시간 unrealized_pct가 +0.5% 이상일 때만 청산
-                            if not pnl_calc_ok or unrealized_pct < 0.5:
+                            # 슬리피지 방어: 실시간 unrealized_pct가 +1.5% 이상일 때만 청산
+                            # (시장가 슬리피지 + 왕복 수수료 버퍼 확보)
+                            if not pnl_calc_ok or unrealized_pct < 1.5:
                                 logger.debug(
                                     f"[{prefix}] EXIT 시그널 무시 — "
-                                    f"unrealized={unrealized_pct:+.2f}% < +0.5% (슬리피지 방어 홀딩)"
+                                    f"unrealized={unrealized_pct:+.2f}% < +1.5% (슬리피지 방어 홀딩)"
                                 )
                                 await asyncio.sleep(POLL_INTERVAL_SEC)
                                 continue

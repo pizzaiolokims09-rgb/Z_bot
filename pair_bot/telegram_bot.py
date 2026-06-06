@@ -26,7 +26,7 @@ from telegram.ext import (
 )
 from telegram.error import TelegramError
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, STOP_LOSS_COOLDOWN_SEC, SECTORS
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, STOP_LOSS_COOLDOWN_SEC, SECTORS, ENTRY_MIN_CORRELATION
 from bot_state import BotState
 from pair_scanner import PairScanner
 
@@ -57,6 +57,7 @@ class TelegramNotifier:
     BTN_STATUS  = "📊 상태 확인"
     BTN_STATS   = "💰 승률 & PnL"
     BTN_SCAN    = "🔍 페어 스캔"
+    BTN_MANAGE  = "⚙️ 페어 관리"
 
     def _reply_keyboard(self) -> ReplyKeyboardMarkup:
         """항상 입력창 위에 고정되는 하단 키보드를 반환합니다."""
@@ -65,7 +66,7 @@ class TelegramNotifier:
                 [KeyboardButton(self.BTN_CLOSE)],
                 [KeyboardButton(self.BTN_STOP), KeyboardButton(self.BTN_RESUME)],
                 [KeyboardButton(self.BTN_STATUS), KeyboardButton(self.BTN_STATS)],
-                [KeyboardButton(self.BTN_SCAN)],
+                [KeyboardButton(self.BTN_SCAN), KeyboardButton(self.BTN_MANAGE)],
             ],
             resize_keyboard=True,
             one_time_keyboard=False,
@@ -248,7 +249,7 @@ class TelegramNotifier:
                 side = "L-A/S-B" if pos.side == "LONG_A_SHORT_B" else "S-A/L-B"
                 lines.append(f"  • [{prefix}] {side} | dev={dev:+.3f}%")
             pos_text = "\n".join(lines) if lines else "  없음"
-            
+
             # 쿨다운 블랙리스트 계산
             cd_lines = []
             now = time.time()
@@ -261,16 +262,14 @@ class TelegramNotifier:
                     cd_lines.append(f"  • [{p}] 🚫 {time_str} 남음")
             cd_text = "\n".join(cd_lines) if cd_lines else "  없음"
 
-            # ── 현재 감시 유니버스 브리핑 ──
+            # ── 감시 유니버스 (페어별 승률 + 상관계수) ──
             from config import PAIRS_TO_TRADE
-            # 섹터 역매핑: 코인 → 섹터 이름
             _coin_to_sector = {}
             for sec_name, coins in SECTORS.items():
                 for c in coins:
                     _coin_to_sector[c] = sec_name
 
-            # 섹터별로 페어 그룹핑 (중복 제거)
-            sector_pairs = {}  # {섹터명: [prefix, ...]}
+            sector_pairs = {}
             uncategorized = []
             seen_prefixes = set()
             for sym_a, sym_b in PAIRS_TO_TRADE:
@@ -278,8 +277,10 @@ class TelegramNotifier:
                 b_base = sym_b.split("/")[0]
                 prefix = f"{a_base}-{b_base}"
                 if prefix in seen_prefixes:
-                    continue  # 중복 페어 무시
+                    continue
                 seen_prefixes.add(prefix)
+                if prefix in self._state.paused_pairs:
+                    continue
                 sec_a = _coin_to_sector.get(a_base, "")
                 sec_b = _coin_to_sector.get(b_base, "")
                 sec = sec_a or sec_b or ""
@@ -288,30 +289,57 @@ class TelegramNotifier:
                 else:
                     uncategorized.append(prefix)
 
+            def _pair_info(p: str) -> str:
+                stats = self._state.pair_stats.get(p, {"win": 0, "lose": 0})
+                w = stats.get("win", 0)
+                l = stats.get("lose", 0)
+                total = w + l
+                wr = (w / total * 100) if total > 0 else 0.0
+                corr_val = self._state.latest_corr.get(p)
+                corr_str = f"{corr_val:+.2f}" if corr_val is not None else "대기 중"
+                return f"▶️ {p} (승률: {wr:.1f}% ({w}승 {l}패) | Corr: {corr_str})"
+
             univ_lines = []
             for sec_name, prefixes in sector_pairs.items():
-                pair_str = "  ".join(prefixes)
-                univ_lines.append(f"  [{sec_name}] {pair_str}")
+                univ_lines.append(f"  [{sec_name}]")
+                for p in prefixes:
+                    univ_lines.append(f"    {_pair_info(p)}")
             if uncategorized:
-                univ_lines.append(f"  [기타] {'  '.join(uncategorized)}")
+                univ_lines.append(f"  [기타]")
+                for p in uncategorized:
+                    univ_lines.append(f"    {_pair_info(p)}")
             univ_text = "\n".join(univ_lines) if univ_lines else "  없음"
 
-            # pending_swaps 표시
+            paused_lines = []
+            for p in sorted(self._state.paused_pairs):
+                stats = self._state.pair_stats.get(p, {"win": 0, "lose": 0})
+                w = stats.get("win", 0)
+                l = stats.get("lose", 0)
+                total = w + l
+                wr = (w / total * 100) if total > 0 else 0.0
+                paused_lines.append(f"  🔴 {p} ({wr:.1f}% | {w}승 {l}패)")
+            paused_text = "\n".join(paused_lines) if paused_lines else "  없음"
+
             swap_lines = []
             for old_p, (new_a, new_b) in self._state.pending_swaps.items():
                 new_p = f"{new_a.split('/')[0]}-{new_b.split('/')[0]}"
                 swap_lines.append(f"  • [{old_p}] → [{new_p}]")
             swap_text = "\n".join(swap_lines) if swap_lines else "  없음"
 
+            active_count = len(seen_prefixes) - len(self._state.paused_pairs)
             await update.message.reply_text(
                 f"📊 봇 상태: {status_str}\n"
                 f"가용 잔고: {bal_str}\n\n"
                 f"활성 포지션 ({len(self._state.positions)}개):\n{pos_text}\n\n"
                 f"블랙리스트 (쿨다운 중):\n{cd_text}\n\n"
-                f"🔭 감시 유니버스 ({len(PAIRS_TO_TRADE)}개 페어):\n{univ_text}\n\n"
+                f"🔭 감시 유니버스 ({active_count}개 활성):\n{univ_text}\n\n"
+                f"🚫 감시 일시 정지됨 (Paused):\n{paused_text}\n\n"
                 f"⏳ 교체 예약 (Pending Swap):\n{swap_text}",
                 reply_markup=self._reply_keyboard(),
             )
+
+        elif text == self.BTN_MANAGE:
+            await self._show_manage_menu(update)
 
         elif text == self.BTN_SCAN:
             # 스캔 중복 방지
@@ -362,8 +390,10 @@ class TelegramNotifier:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         query = update.callback_query
-        await query.answer()
         data  = query.data
+        # mgconfirm_ 계열은 내부에서 show_alert=True answer를 호출하므로 여기서 스킵
+        if not data.startswith("mgconfirm_"):
+            await query.answer()
 
         _confirm_kb = lambda cd: InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ 확인", callback_data=cd),
@@ -412,6 +442,18 @@ class TelegramNotifier:
 
         elif data == "back_to_menu":
             await self._back_to_menu(query)
+
+        # ── /manage 페어 관리 콜백 ────────────────────────────────────────
+        elif data == "manage_back":
+            await self._render_manage_buttons(query)
+
+        elif data.startswith("manage_"):
+            prefix = data[len("manage_"):]
+            await self._show_manage_confirm(query, prefix)
+
+        elif data.startswith("mgconfirm_"):
+            prefix = data[len("mgconfirm_"):]
+            await self._execute_manage_toggle(query, prefix)
 
         # ── 스캔/교체 콜백 핸들러 ─────────────────────────────────────────────
         elif data.startswith("scan_sector:"):
@@ -734,6 +776,108 @@ class TelegramNotifier:
                 f"[{old_prefix}] → [{new_prefix}]\n"
                 f"다음 매매 사이클부터 새 페어로 감시를 시작합니다."
             )
+
+    # =========================================================================
+    # /manage 페어 관리 메뉴 (인라인 버튼 + 2단계 확인)
+    # =========================================================================
+
+    def _build_manage_buttons(self) -> InlineKeyboardMarkup:
+        """전체 유니버스의 페어별 감시 상태 인라인 버튼 격자 생성."""
+        from config import PAIRS_TO_TRADE
+        seen = set()
+        buttons = []
+        row = []
+        for sym_a, sym_b in PAIRS_TO_TRADE:
+            a_base = sym_a.split("/")[0]
+            b_base = sym_b.split("/")[0]
+            prefix = f"{a_base}-{b_base}"
+            if prefix in seen:
+                continue
+            seen.add(prefix)
+            emoji = "🔴" if prefix in self._state.paused_pairs else "🟢"
+            row.append(InlineKeyboardButton(
+                f"{emoji} {prefix}", callback_data=f"manage_{prefix}"
+            ))
+            if len(row) == 3:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append([InlineKeyboardButton("❌ 닫기", callback_data="cancel_action")])
+        return InlineKeyboardMarkup(buttons)
+
+    async def _show_manage_menu(self, update: Update) -> None:
+        """/manage 버튼 텍스트 핸들러: 전체 페어 격자 출력."""
+        await update.message.reply_text(
+            "⚙️ 페어 감시 관리\n"
+            "🟢 = 감시 중 | 🔴 = 일시 정지\n"
+            "페어를 터치하면 상태를 전환할 수 있습니다.",
+            reply_markup=self._build_manage_buttons(),
+        )
+
+    async def _render_manage_buttons(self, query) -> None:
+        """콜백에서 관리 버튼 격자로 되돌아가기."""
+        await query.edit_message_text(
+            "⚙️ 페어 감시 관리\n"
+            "🟢 = 감시 중 | 🔴 = 일시 정지\n"
+            "페어를 터치하면 상태를 전환할 수 있습니다.",
+            reply_markup=self._build_manage_buttons(),
+        )
+
+    async def _show_manage_confirm(self, query, prefix: str) -> None:
+        """2단계 확인 화면: 해당 페어의 상세 정보 + 확인/취소 버튼."""
+        stats = self._state.pair_stats.get(prefix, {"win": 0, "lose": 0})
+        w = stats.get("win", 0)
+        l = stats.get("lose", 0)
+        total = w + l
+        wr = (w / total * 100) if total > 0 else 0.0
+        corr_val = self._state.latest_corr.get(prefix)
+        corr_str = f"{corr_val:+.2f}" if corr_val is not None else "데이터 없음"
+
+        is_paused = prefix in self._state.paused_pairs
+        action = "재개 🟢" if is_paused else "제외 🚫"
+
+        await query.edit_message_text(
+            f"⚠️ [{prefix}] 페어의 누적 승률은 {wr:.1f}%({w}승 {l}패)이며,\n"
+            f"최근 상관계수는 {corr_str}입니다.\n\n"
+            f"이 페어를 감시에서 [{action}] 하시겠습니까?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ 확인(실행)", callback_data=f"mgconfirm_{prefix}"),
+                 InlineKeyboardButton("🔙 취소(목록으로)", callback_data="manage_back")]
+            ]),
+        )
+
+    async def _execute_manage_toggle(self, query, prefix: str) -> None:
+        """확인 버튼 클릭 → 실제 토글 실행 (포지션 보호 잠금 포함)."""
+        from state_persistence import save_state
+
+        is_paused = prefix in self._state.paused_pairs
+
+        if is_paused:
+            # 재개: paused_pairs에서 제거
+            self._state.paused_pairs.discard(prefix)
+            await save_state(self._state)
+            logger.info(f"[페어관리] {prefix} 감시 재개")
+            await query.answer(f"✅ [{prefix}] 감시가 재개되었습니다.", show_alert=True)
+        else:
+            # 정지 시도: 포지션 보호 잠금 검사
+            if prefix in self._state.positions:
+                await query.answer(
+                    f"⚠️ 현재 포지션이 진행 중인 페어는 감시를 제외할 수 없습니다.\n"
+                    f"포지션 종료 후 시도하세요.",
+                    show_alert=True,
+                )
+                # 버튼 목록으로 복귀
+                await self._render_manage_buttons(query)
+                return
+            # 안전: paused_pairs에 추가
+            self._state.paused_pairs.add(prefix)
+            await save_state(self._state)
+            logger.info(f"[페어관리] {prefix} 감시 일시 정지")
+            await query.answer(f"🚫 [{prefix}] 감시가 일시 정지되었습니다.", show_alert=True)
+
+        # 토글 완료 후 버튼 목록으로 복귀
+        await self._render_manage_buttons(query)
 
     # =========================================================================
     # 내부 전송 헬퍼

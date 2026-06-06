@@ -71,6 +71,8 @@ async def save_state(bot_state: BotState) -> None:
         "daily_reset_date": bot_state.daily_reset_date,
         "pending_swaps" : swaps_data,
         "active_pairs"  : active_pairs,
+        "pair_stats"    : bot_state.pair_stats,
+        "paused_pairs"  : list(bot_state.paused_pairs),
         "saved_at"      : _dt_to_str(datetime.now(KST)),
     }
 
@@ -117,6 +119,13 @@ async def load_state(bot_state: BotState) -> bool:
                 bot_state.pending_swaps[k] = tuple(v)
         if bot_state.pending_swaps:
             logger.info(f"[StateStore] pending_swaps 복구: {bot_state.pending_swaps}")
+
+        # pair_stats 복구
+        bot_state.pair_stats = data.get("pair_stats", {})
+
+        # paused_pairs 복구
+        raw_paused = data.get("paused_pairs", [])
+        bot_state.paused_pairs = set(raw_paused) if isinstance(raw_paused, list) else set()
 
         # 런타임 페어 리스트 복구 (config.py 하드코딩 리스트를 덮어씀)
         saved_pairs = data.get("active_pairs")

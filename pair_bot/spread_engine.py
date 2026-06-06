@@ -14,7 +14,7 @@ from config import (
     ENTRY_Z_SCORE_SWING, ENTRY_Z_SCORE_SHORT,
     EXIT_Z_SCORE, STOP_LOSS_Z_SCORE,
     MIN_SPREAD_THRESHOLD,
-    MIN_WARMUP_RATIO, TREND_SLOPE_THRESHOLD,
+    MIN_WARMUP_RATIO, TREND_SLOPE_THRESHOLD_PCT, TREND_SLOPE_WINDOW,
 )
 
 logger = logging.getLogger("pair_bot")
@@ -77,9 +77,10 @@ class SpreadEngine:
         mean_sh, std_sh = self._calc_stats(self._window_short)
         z_short = (ratio - mean_sh) / std_sh if std_sh > 1e-12 else 0.0
 
-        # 추세 감지 (스윙 윈도우 기준)
+        # 추세 감지 (정규화 % — 페어 비율 스케일에 무관)
         slope = self._calc_slope(self._window_swing)
-        is_trending = abs(slope) > TREND_SLOPE_THRESHOLD
+        normalized_slope_pct = (abs(slope) / mean_sw * 100) if mean_sw > 1e-12 else 0.0
+        is_trending = normalized_slope_pct > TREND_SLOPE_THRESHOLD_PCT
 
         signal, entry_window = self._classify_signal(
             z_swing, z_short, dev_pct, ready, is_trending
@@ -96,6 +97,7 @@ class SpreadEngine:
             "signal"        : signal,
             "ready"         : ready,
             "slope"         : slope,
+            "normalized_slope_pct": normalized_slope_pct,
             "is_trending"   : is_trending,
             "entry_window"  : entry_window,
         }
@@ -160,14 +162,14 @@ class SpreadEngine:
     def _calc_slope(self, window: collections.deque) -> float:
         """
         최근 ratio 데이터의 선형 회귀 기울기 (추세 감지).
-        10초 폴링 기준 30개 = 최근 5분간 기울기를 계산합니다.
+        3초 폴링 기준 100개 = 최근 5분간 기울기를 계산합니다.
         기울기가 양수면 ratio 상승 추세, 음수면 하락 추세.
         """
         n = len(window)
-        if n < 30:
+        if n < TREND_SLOPE_WINDOW:
             return 0.0
 
-        sample_size = min(30, n)
+        sample_size = min(TREND_SLOPE_WINDOW, n)
         recent = list(window)[-sample_size:]
         n_s = len(recent)
         x_mean = (n_s - 1) / 2.0

@@ -44,6 +44,7 @@ def main():
     data["total_trades"]   = 0
     data["wins"]           = 0
     data["cumulative_pnl"] = 0.0
+    data["pair_stats"]     = {}  # 페어별 승/패 통계도 함께 초기화
 
     # 저장 시각 갱신
     data["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
