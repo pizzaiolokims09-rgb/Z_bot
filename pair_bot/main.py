@@ -596,6 +596,7 @@ async def pair_loop(
             window = spread_engine.window_size
 
             bot_state.latest_dev[prefix] = dev
+            bot_state.latest_corr[prefix] = calc_pearson_corr(corr_prices_a, corr_prices_b)
 
             # 주기적 상태 로그 (60초마다 DEBUG → bot.log에 기록)
             if int(time.time()) % 60 == 0:
@@ -655,7 +656,7 @@ async def pair_loop(
                     continue
 
                 # ── 진입 상관계수 사전 검증 (디커플링 차단) ──────────────────
-                entry_corr = calc_pearson_corr(corr_prices_a, corr_prices_b)
+                entry_corr = bot_state.latest_corr.get(prefix, 0.0)
                 if entry_corr < ENTRY_MIN_CORRELATION:
                     entry_confirm_ts = 0.0
                     logger.debug(
@@ -923,9 +924,8 @@ async def pair_loop(
                         except Exception as e2:
                             logger.error(f"[{prefix}] Fallback PnL 계산도 실패 (방어막 무력화): {e2}")
 
-                    # ── 공통: 상관계수 계산 ──
-                    corr = calc_pearson_corr(corr_prices_a, corr_prices_b)
-                    bot_state.latest_corr[prefix] = corr
+                    # ── 공통: 상관계수 가져오기 ──
+                    corr = bot_state.latest_corr.get(prefix, 0.0)
 
                     # ── 우선순위 1: 익절 (+3.5%) ──
                     if pnl_calc_ok and unrealized_pct >= TARGET_NET_PNL_PCT:
