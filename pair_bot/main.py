@@ -377,7 +377,11 @@ async def check_kill_switch(
 # ─────────────────────────────────────────────────────────────────────────────
 # 워밍업 데이터 조회 (과거 1m 봉 가져와서 윈도우 채우기)
 # ─────────────────────────────────────────────────────────────────────────────
-async def prefetch_warmup_data(exchange: ccxt_async.Exchange, sym_a: str, sym_b: str, spread_engine: SpreadEngine, prefix: str):
+async def prefetch_warmup_data(
+    exchange: ccxt_async.Exchange, sym_a: str, sym_b: str, 
+    spread_engine: SpreadEngine, prefix: str,
+    corr_prices_a: deque = None, corr_prices_b: deque = None
+):
     """
     1분봉 1440개(24시간 분량)를 가져와서 10초 폴링(1분에 6개) 효과를 내도록
     듀얼 윈도우(스윙 8640 / 단기 4320)에 채워 넣습니다.
@@ -413,6 +417,12 @@ async def prefetch_warmup_data(exchange: ccxt_async.Exchange, sym_a: str, sym_b:
                 # 1분(60초) = 3초 폴링 * 20회 반복 삽입으로 가중치 맞춤
                 for _ in range(20):
                     spread_engine.update(price_a, price_b)
+                
+                # 상관계수 계산용 1분봉 데이터도 함께 채움
+                if corr_prices_a is not None:
+                    corr_prices_a.append(price_a)
+                if corr_prices_b is not None:
+                    corr_prices_b.append(price_b)
             
             # 이벤트 루프 블로킹 방지 (텔레그램 타임아웃 방어)
             if i % 100 == 0:
@@ -520,7 +530,10 @@ async def pair_loop(
             logger.error(f"[{prefix}] 진입 시간 복구 실패: {e}")
 
     # ── 워밍업 데이터 프리패치 ──
-    await prefetch_warmup_data(exchange, sym_a, sym_b, spread_engine, prefix)
+    await prefetch_warmup_data(
+        exchange, sym_a, sym_b, spread_engine, prefix,
+        corr_prices_a=corr_prices_a, corr_prices_b=corr_prices_b
+    )
 
     while True:
         try:
