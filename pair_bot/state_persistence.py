@@ -73,6 +73,9 @@ async def save_state(bot_state: BotState) -> None:
         "active_pairs"  : active_pairs,
         "pair_stats"    : bot_state.pair_stats,
         "paused_pairs"  : list(bot_state.paused_pairs),
+        "dynamic_universe": bot_state.dynamic_universe,
+        "zombie_pairs"  : list(bot_state.zombie_pairs),
+        "last_scan_time": bot_state.last_scan_time,
         "saved_at"      : _dt_to_str(datetime.now(KST)),
     }
 
@@ -126,6 +129,18 @@ async def load_state(bot_state: BotState) -> bool:
         # paused_pairs 복구
         raw_paused = data.get("paused_pairs", [])
         bot_state.paused_pairs = set(raw_paused) if isinstance(raw_paused, list) else set()
+
+        # 다이내믹 스캐너 결과 복구
+        bot_state.dynamic_universe = data.get("dynamic_universe", [])
+        bot_state.last_scan_time = data.get("last_scan_time", 0.0)
+        raw_zombies = data.get("zombie_pairs", [])
+        bot_state.zombie_pairs = set(raw_zombies) if isinstance(raw_zombies, list) else set()
+        if bot_state.dynamic_universe:
+            logger.info(
+                f"[StateStore] 다이내믹 유니버스 복구 | "
+                f"{len(bot_state.dynamic_universe)}개 페어 | "
+                f"좀비: {len(bot_state.zombie_pairs)}개"
+            )
 
         # 런타임 페어 리스트 복구 (config.py 하드코딩 리스트를 덮어씀)
         saved_pairs = data.get("active_pairs")

@@ -1,7 +1,7 @@
 # =============================================================================
 # pair_bot/main.py
 # 페어 트레이딩 봇 — 메인 진입점 (20개 페어 병렬 감시 + 텔레그램 연동)
-# 고승률 스나이퍼 & 수수료 최적화 모드
+# Phase 1: 공적분 검정 진입 + Maker-Chasing 익절 엔진
 # 실행: python main.py
 # =============================================================================
 
@@ -15,6 +15,8 @@ from datetime import date, datetime
 from logging.handlers import RotatingFileHandler
 
 import ccxt.async_support as ccxt_async
+import numpy as np
+from statsmodels.tsa.stattools import coint
 
 from config import (
     IS_PAPER_TRADING, PAIRS_TO_TRADE,
@@ -30,6 +32,8 @@ from config import (
     ENTRY_CONFIRMATION_SEC, MAX_LOSS_PCT,
     CORR_WINDOW_MIN, CORR_STOP_THRESHOLD, STOP_LOSS_Z_SCORE,
     ENTRY_MIN_CORRELATION,
+    COINT_PVALUE_THRESHOLD, COINT_MIN_SAMPLES,
+    SCANNER_INTERVAL_HOURS,
 )
 from spread_engine      import SpreadEngine
 from risk_manager       import RiskManager
@@ -38,6 +42,7 @@ from bot_state          import BotState, PairPosition
 from telegram_bot       import TelegramNotifier
 from trade_logger       import init_csv, log_trade, _now_kst
 from state_persistence  import save_state, load_state
+from scanner            import DynamicScanner
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -172,18 +177,53 @@ async def _execute_close(
     z_score: float = 0.0,      # 청산 시점 Z-Score (CSV 로깅용)
     close_reason: str = "",    # 상세 청산 사유 (텔레그램 알림용)
 ):
-    """청산 주문 → Net PnL 계산(실체결가 기반) → 상태 정리 → 텔레그램 알림 → CSV 기록 → 상태 저장."""
+    """청산 주문 → Net PnL 계산(실체결가 기반) → 상태 정리 → 텔레그램 알림 → CSV 기록 → 상태 저장.
+    
+    ABORTED 반환 시 청산을 포기하고 포지션을 유지(Hold)합니다.
+    반환: True=청산 완료, False=ABORTED(포지션 유지)
+    """
     pos = bot_state.positions.get(prefix)
     is_maker = (reason == "TAKE_PROFIT")
 
-    # 익절 시 지정가(Maker), 그 외 시장가(Taker) 청산
+    # 익절 시 Maker-Chasing, 그 외 시장가(Taker) 청산
     results = None
     if is_maker and pos:
-        results = await order_executor.close_pair_limit(
-            sym_a=sym_a, price_a=price_a,
-            sym_b=sym_b, price_b=price_b,
-            pos_side=pos.side, pair_prefix=prefix,
+        # Chasing용 포지션 정보 구성 (예상 PnL 가계산에 필요)
+        qty_a = (pos.margin_a * LEVERAGE) / pos.price_a
+        qty_b = (pos.margin_b * LEVERAGE) / pos.price_b
+        common_info = {
+            "entry_price_a": pos.price_a,
+            "entry_price_b": pos.price_b,
+            "margin_a": pos.margin_a,
+            "margin_b": pos.margin_b,
+            "qty_a": qty_a,
+            "qty_b": qty_b,
+            "side": pos.side,
+        }
+        pos_info_a = {**common_info, "leg": "A", "current_price_other": price_b}
+        pos_info_b = {**common_info, "leg": "B", "current_price_other": price_a}
+
+        results = await order_executor.close_pair_chase(
+            sym_a=sym_a, sym_b=sym_b, pair_prefix=prefix,
+            pos_info_a=pos_info_a, pos_info_b=pos_info_b,
         )
+
+        # ── ABORTED 처리: 한쪽이라도 추적 포기하면 청산 전체 포기 (Hold) ──
+        if results:
+            a_aborted = isinstance(results[0], dict) and results[0].get("status") == "ABORTED"
+            b_aborted = isinstance(results[1], dict) and results[1].get("status") == "ABORTED"
+
+            if a_aborted or b_aborted:
+                abort_reasons = []
+                if a_aborted:
+                    abort_reasons.append(f"A: {results[0].get('reason', '?')}")
+                if b_aborted:
+                    abort_reasons.append(f"B: {results[1].get('reason', '?')}")
+                logger.info(
+                    f"[{prefix}] Chasing ABORTED → 청산 포기, 포지션 유지(Hold) | "
+                    + " | ".join(abort_reasons)
+                )
+                return False  # ★ 청산 포기 — 포지션 유지
     else:
         results = await order_executor.close_pair(
             sym_a=sym_a, price_a=price_a,
@@ -434,7 +474,7 @@ async def prefetch_warmup_data(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 피어슨 상관계수 헬퍼 (스마트 손절용)
+# 피어슨 상관계수 헬퍼 (스마트 손절용 — 유지)
 # ─────────────────────────────────────────────────────────────────────────────
 def calc_pearson_corr(prices_a: deque, prices_b: deque) -> float:
     """
@@ -462,6 +502,38 @@ def calc_pearson_corr(prices_a: deque, prices_b: deque) -> float:
         return 1.0  # 분산이 0이면 상관계수 계산 불가 → 안전 반환
 
     return numerator / (denom_a ** 0.5 * denom_b ** 0.5)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 공적분(Cointegration) 검정 헬퍼 (진입 필터 핵심 엔진)
+# ─────────────────────────────────────────────────────────────────────────────
+def calc_cointegration_pvalue(
+    prices_a: deque, prices_b: deque,
+    min_samples: int = COINT_MIN_SAMPLES,
+) -> float:
+    """
+    두 가격 시계열의 Engle-Granger 공적분 검정 p-value를 반환합니다.
+
+    p-value가 낮을수록(0.05 이하) 두 시계열이 장기적으로
+    평균 회귀하는 관계(공적분 관계)에 있을 가능성이 높습니다.
+
+    - 데이터가 min_samples 미만이면 1.0 반환 (진입 차단)
+    - 계산 예외 발생 시에도 1.0 반환 (안전 우선)
+    """
+    n = min(len(prices_a), len(prices_b))
+    if n < min_samples:
+        return 1.0  # 데이터 부족 → 진입 차단
+
+    try:
+        a_arr = np.array(list(prices_a)[-n:], dtype=np.float64)
+        b_arr = np.array(list(prices_b)[-n:], dtype=np.float64)
+
+        # Engle-Granger 2단계 공적분 검정
+        # 반환: (t-statistic, p-value, crit_values)
+        _, pvalue, _ = coint(a_arr, b_arr)
+        return float(pvalue)
+    except Exception:
+        return 1.0  # 계산 실패 → 안전하게 진입 차단
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -668,12 +740,16 @@ async def pair_loop(
                     await asyncio.sleep(POLL_INTERVAL_SEC)
                     continue
 
-                # ── 진입 상관계수 사전 검증 (디커플링 차단) ──────────────────
-                entry_corr = bot_state.latest_corr.get(prefix, 0.0)
-                if entry_corr < ENTRY_MIN_CORRELATION:
+                # ── 진입 공적분 검정 사전 검증 (평균 회귀성 수학적 증명) ──────
+                coint_pvalue = calc_cointegration_pvalue(
+                    corr_prices_a, corr_prices_b, min_samples=COINT_MIN_SAMPLES
+                )
+                bot_state.latest_coint_pvalue[prefix] = coint_pvalue
+                if coint_pvalue > COINT_PVALUE_THRESHOLD:
                     entry_confirm_ts = 0.0
                     logger.debug(
-                        f"[{prefix}] 진입 차단 — 상관계수={entry_corr:.3f} < {ENTRY_MIN_CORRELATION} (디커플링)"
+                        f"[{prefix}] 진입 차단 — 공적분 p-value={coint_pvalue:.4f} > "
+                        f"{COINT_PVALUE_THRESHOLD} (평균 회귀 미증명)"
                     )
                     await asyncio.sleep(POLL_INTERVAL_SEC)
                     continue
@@ -948,13 +1024,17 @@ async def pair_loop(
                             f"gross={gross_pnl:+.4f} fee={total_fee:.4f} "
                             f"net={unrealized_net:+.4f} USDT ({unrealized_pct:+.2f}%)"
                         )
-                        await _execute_close(
+                        close_result = await _execute_close(
                             prefix, "TAKE_PROFIT", price_a, price_b,
                             sym_a, sym_b, risk_manager, order_executor,
                             bot_state, notifier, logger, dev,
                             z_score=state["z_score"],
                             close_reason=f"목표 순수익(+{TARGET_NET_PNL_PCT}%) 도달 익절",
                         )
+                        # Chasing ABORTED 시 포지션 유지, 다음 루프에서 재시도
+                        if close_result is False:
+                            await asyncio.sleep(POLL_INTERVAL_SEC)
+                            continue
                         entry_timestamp = 0.0
                         if prefix in bot_state.pending_swaps:
                             new_a, new_b = bot_state.pending_swaps.pop(prefix)
@@ -1067,12 +1147,16 @@ async def pair_loop(
                                 )
                                 await asyncio.sleep(POLL_INTERVAL_SEC)
                                 continue
-                            await _execute_close(
+                            close_result = await _execute_close(
                                 prefix, "TAKE_PROFIT", price_a, price_b,
                                 sym_a, sym_b, risk_manager, order_executor,
                                 bot_state, notifier, logger, dev,
                                 z_score=state["z_score"],
                             )
+                            # Chasing ABORTED 시 포지션 유지, 다음 루프에서 재시도
+                            if close_result is False:
+                                await asyncio.sleep(POLL_INTERVAL_SEC)
+                                continue
                             entry_timestamp = 0.0
                             if prefix in bot_state.pending_swaps:
                                 new_a, new_b = bot_state.pending_swaps.pop(prefix)
@@ -1106,7 +1190,206 @@ async def pair_loop(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 메인 루프 — 20개 페어 병렬 + 텔레그램 앱 동시 실행
+# 다이내믹 스캐너 루프 — 백그라운드에서 주기적으로 최적 페어 교체
+# ─────────────────────────────────────────────────────────────────────────────
+async def dynamic_scanner_loop(
+    exchange, bot_state, notifier, order_executor,
+    entry_lock, active_tasks: dict,
+):
+    """
+    백그라운드에서 SCANNER_INTERVAL_HOURS마다 다이내믹 스캐너를 실행하고
+    PAIRS_TO_TRADE를 무중단 핫 스왑합니다.
+
+    핵심 안전장치:
+    1. 활성 포지션이 있는 페어는 '좀비(Zombie)'로 보호 → 포지션 청산 시 자연 소멸
+    2. paused_pairs에 있는 페어는 스캐너가 찾아와도 제외
+    3. 교체 시 빠진 페어의 pair_loop Task를 cancel()하여 메모리 누수(유령 루프) 완벽 차단
+    """
+    logger = logging.getLogger("pair_bot")
+    scanner = DynamicScanner()
+    interval_sec = SCANNER_INTERVAL_HOURS * 3600
+
+    # 봇 시작 시 워밍업 대기 (기존 루프들이 안정화될 시간)
+    await asyncio.sleep(30)
+    logger.info(
+        f"[DynScanner] 다이내믹 스캐너 루프 시작 | "
+        f"주기: {SCANNER_INTERVAL_HOURS}시간"
+    )
+
+    while True:
+        try:
+            logger.info("[DynScanner] ═══ 스캔 사이클 시작 ═══")
+
+            # 스캔 전용 exchange (공용 API, 키 불필요)
+            import ccxt.async_support as _ccxt
+            scan_exchange = _ccxt.binanceusdm({
+                "options": {
+                    "defaultType": "future",
+                    "adjustForTimeDifference": True,
+                },
+                "enableRateLimit": True,
+            })
+
+            try:
+                new_pairs = await scanner.run_full_scan(scan_exchange)
+            finally:
+                await scan_exchange.close()
+
+            if not new_pairs:
+                logger.warning(
+                    "[DynScanner] 유효 페어 없음 — 기존 유니버스 유지"
+                )
+                await asyncio.sleep(interval_sec)
+                continue
+
+            # ── 결과를 bot_state에 캐시 ──
+            import time as _time
+            bot_state.dynamic_universe = new_pairs
+            bot_state.last_scan_time = _time.time()
+
+            # 새 유니버스 prefix 집합
+            new_prefixes = set()
+            new_pair_map = {}  # {prefix: (sym_a, sym_b)}
+            for p in new_pairs:
+                pf = p["pair"]
+                new_prefixes.add(pf)
+                new_pair_map[pf] = (p["sym_a"], p["sym_b"])
+
+            # paused_pairs 제외
+            new_prefixes -= bot_state.paused_pairs
+            for pp in bot_state.paused_pairs:
+                new_pair_map.pop(pp, None)
+
+            # 기존 active_tasks의 prefix 집합
+            old_prefixes = set(active_tasks.keys())
+
+            # ── DIFF 계산 ──
+            to_add = new_prefixes - old_prefixes     # 새로 감시할 페어
+            to_remove = old_prefixes - new_prefixes  # 감시 해제할 페어
+            to_keep = old_prefixes & new_prefixes    # 유지할 페어
+
+            # ── 1) 감시 해제 대상 처리 (Task Cancel + 좀비 보호) ──
+            killed_count = 0
+            zombie_count = 0
+            for pf in to_remove:
+                if pf in bot_state.positions:
+                    # 활성 포지션 보유 → 좀비로 보호 (Task 유지!)
+                    bot_state.zombie_pairs.add(pf)
+                    zombie_count += 1
+                    logger.info(
+                        f"[DynScanner] 🧟 좀비 보호: {pf} "
+                        f"(활성 포지션 보유 → 청산 시 자동 제거)"
+                    )
+                else:
+                    # 포지션 없음 → Task 완전 Kill
+                    task = active_tasks.pop(pf, None)
+                    if task and not task.done():
+                        task.cancel()
+                        killed_count += 1
+                        logger.info(
+                            f"[DynScanner] 💀 Task Kill: {pf} "
+                            f"(포지션 없음 → pair_loop 제거)"
+                        )
+
+            # ── 좀비 페어 정리: 포지션이 이미 청산된 좀비 제거 ──
+            cleared_zombies = []
+            for zp in list(bot_state.zombie_pairs):
+                if zp not in bot_state.positions:
+                    # 포지션 청산 완료 → 좀비에서 해제 + Task Kill
+                    bot_state.zombie_pairs.discard(zp)
+                    task = active_tasks.pop(zp, None)
+                    if task and not task.done():
+                        task.cancel()
+                    cleared_zombies.append(zp)
+            if cleared_zombies:
+                logger.info(
+                    f"[DynScanner] 🧹 좀비 정리 완료: "
+                    f"{', '.join(cleared_zombies)}"
+                )
+
+            # ── 2) 새 페어 추가 (pair_loop Task 생성) ──
+            added_count = 0
+            for pf in to_add:
+                sym_a, sym_b = new_pair_map[pf]
+                task = asyncio.create_task(
+                    pair_loop(
+                        sym_a, sym_b, exchange,
+                        order_executor, bot_state, notifier, entry_lock,
+                    ),
+                    name=f"pair_loop:{pf}",
+                )
+                active_tasks[pf] = task
+                added_count += 1
+                logger.info(
+                    f"[DynScanner] ✅ 신규 등록: {pf} "
+                    f"({sym_a} / {sym_b})"
+                )
+
+            # ── 3) PAIRS_TO_TRADE 리스트 동기화 ──
+            PAIRS_TO_TRADE.clear()
+            # 새 유니버스 (paused 제외)
+            for pf in new_prefixes:
+                if pf in new_pair_map:
+                    sym_a, sym_b = new_pair_map[pf]
+                    PAIRS_TO_TRADE.append((sym_a, sym_b))
+            # 좀비 페어도 PAIRS_TO_TRADE에 추가 (감시 유지)
+            for zp in bot_state.zombie_pairs:
+                pos = bot_state.positions.get(zp)
+                if pos:
+                    sym_a = pos.sym_a.split(':')[0]
+                    sym_b = pos.sym_b.split(':')[0]
+                    if (sym_a, sym_b) not in PAIRS_TO_TRADE:
+                        PAIRS_TO_TRADE.append((sym_a, sym_b))
+
+            # ── 4) 레버리지 세팅 (새 코인에 대해) ──
+            try:
+                await order_executor.setup_leverage()
+            except Exception as e:
+                logger.warning(f"[DynScanner] 레버리지 세팅 오류: {e}")
+
+            # ── 5) 상태 저장 ──
+            await save_state(bot_state)
+
+            # ── 6) 텔레그램 알림 ──
+            summary_lines = [
+                "🔄 [다이내믹 스캐너] 유니버스 교체 완료\n",
+                f"🆕 신규: {added_count}개 | "
+                f"💀 제거: {killed_count}개 | "
+                f"🧟 좀비: {zombie_count}개 | "
+                f"🔒 유지: {len(to_keep)}개\n",
+            ]
+            for i, p in enumerate(new_pairs[:15], 1):
+                pf = p["pair"]
+                mark = "🧟" if pf in bot_state.zombie_pairs else "✅"
+                summary_lines.append(
+                    f"  {i:2d}. {mark} {pf} "
+                    f"(corr={p['corr']:.2f} | "
+                    f"coint={p['coint_pvalue']:.4f})"
+                )
+            try:
+                await notifier._send("\n".join(summary_lines))
+            except Exception as e:
+                logger.debug(f"[DynScanner] 텔레그램 알림 실패: {e}")
+
+            logger.info(
+                f"[DynScanner] ═══ 스캔 사이클 완료 ═══ | "
+                f"active_tasks={len(active_tasks)}개 | "
+                f"다음 스캔: {SCANNER_INTERVAL_HOURS}시간 후"
+            )
+
+        except asyncio.CancelledError:
+            logger.info("[DynScanner] 스캐너 루프 종료 요청")
+            break
+        except Exception as e:
+            logger.error(
+                f"[DynScanner] 스캔 사이클 오류: {e}", exc_info=True
+            )
+
+        await asyncio.sleep(interval_sec)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 메인 루프 — 페어 병렬 + 텔레그램 앱 동시 실행
 # ─────────────────────────────────────────────────────────────────────────────
 async def main_loop():
     logger = logging.getLogger("pair_bot")
@@ -1253,40 +1536,58 @@ async def main_loop():
     else:
         logger.warning("[텔레그램] 토큰 미설정 — 텔레그램 기능 비활성화")
 
-    # ── 20개 페어 루프 + BTC 변동성 모니터 병렬 실행 ──────────────────────────
+    # ── active_tasks: 페어별 pair_loop Task 추적 딕셔너리 (유령 Task 방지) ───
+    # dynamic_scanner_loop에서 페어 교체 시 cancel()로 루프 정리
+    active_tasks: dict = {}   # {prefix: asyncio.Task}
     entry_lock = asyncio.Lock()  # 신규 진입 동시성 제어용 Lock
-    tasks = []
     
     # 1. PAIRS_TO_TRADE에 있는 페어들 워밍업/루프 등록
-    active_prefixes = set()
     for batch_start in range(0, len(PAIRS_TO_TRADE), WARMUP_BATCH_SIZE):
         batch = PAIRS_TO_TRADE[batch_start:batch_start + WARMUP_BATCH_SIZE]
         for sym_a, sym_b in batch:
             prefix = make_prefix(sym_a, sym_b)
-            active_prefixes.add(prefix)
-            tasks.append(
-                pair_loop(sym_a, sym_b, exchange, order_executor, bot_state, notifier, entry_lock)
-            )
+            if prefix not in active_tasks:
+                task = asyncio.create_task(
+                    pair_loop(sym_a, sym_b, exchange, order_executor, bot_state, notifier, entry_lock),
+                    name=f"pair_loop:{prefix}",
+                )
+                active_tasks[prefix] = task
         if batch_start + WARMUP_BATCH_SIZE < len(PAIRS_TO_TRADE):
             logger.info(f"[워밍업 배치] {batch_start + WARMUP_BATCH_SIZE}/{len(PAIRS_TO_TRADE)}개 시작, 2초 대기...")
             await asyncio.sleep(2)  # 배치 간 2초 딜레이
             
-    # 2. PAIRS_TO_TRADE에는 없지만 아직 안 닫힌 활성 포지션(고아 포지션) 강제 루프 할당 (좀비 방지)
+    # 2. PAIRS_TO_TRADE에는 없지만 아직 안 닫힌 활성 포지션(고아 포지션) 강제 루프 할당
     for prefix, pos in bot_state.positions.items():
-        if prefix not in active_prefixes:
+        if prefix not in active_tasks:
             logger.warning(f"[고아 포지션 복구] {prefix} 페어가 감시 목록에 없지만 활성 포지션이 존재하여 강제로 감시 스레드를 생성합니다.")
-            # ccxt 심볼 포맷(예: RENDER/USDT:USDT)에서 일반 포맷(RENDER/USDT)으로 복원
             sym_a = pos.sym_a.split(':')[0]
             sym_b = pos.sym_b.split(':')[0]
-            tasks.append(
-                pair_loop(sym_a, sym_b, exchange, order_executor, bot_state, notifier, entry_lock)
+            task = asyncio.create_task(
+                pair_loop(sym_a, sym_b, exchange, order_executor, bot_state, notifier, entry_lock),
+                name=f"pair_loop:{prefix}",
             )
+            active_tasks[prefix] = task
+            bot_state.zombie_pairs.add(prefix)  # 스캐너 유니버스 외부이므로 좀비 표시
 
-    tasks.append(global_ticker_loop(exchange, bot_state))
-    tasks.append(btc_turbulence_monitor(exchange, bot_state, notifier))
+    logger.info(f"[Task관리] 초기 active_tasks: {len(active_tasks)}개 페어 루프 등록")
+
+    # ── 시스템 루프들 (개별 Task로 생성) ──────────────────────────────────────
+    system_tasks = [
+        asyncio.create_task(global_ticker_loop(exchange, bot_state), name="global_ticker"),
+        asyncio.create_task(btc_turbulence_monitor(exchange, bot_state, notifier), name="btc_monitor"),
+        asyncio.create_task(
+            dynamic_scanner_loop(
+                exchange, bot_state, notifier,
+                order_executor, entry_lock, active_tasks,
+            ),
+            name="dynamic_scanner",
+        ),
+    ]
 
     try:
-        await asyncio.gather(*tasks)
+        # 모든 Task를 모아서 대기 (페어 루프 + 시스템 루프)
+        all_tasks = list(active_tasks.values()) + system_tasks
+        await asyncio.gather(*all_tasks, return_exceptions=True)
     except KeyboardInterrupt:
         pass
     finally:

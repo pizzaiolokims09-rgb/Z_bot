@@ -3,7 +3,7 @@
 # 실주문(Binance Futures) / 페이퍼 트레이딩 주문 집행기
 # IS_PAPER_TRADING 플래그로 모드 전환
 # 다중 페어 지원: 심볼을 인자로 전달받아 어느 페어든 처리 가능
-# + 지정가(Maker) 익절 청산 & 60초 Fallback
+# + Maker-Chasing 익절 엔진 (지정가 추적 → 100% Maker 체결)
 # =============================================================================
 
 import asyncio
@@ -14,6 +14,8 @@ from config import (
     ORDER_RETRY_COUNT, ORDER_RETRY_WAIT,
     PAPER_INITIAL_BALANCE, ALLOCATION_PER_PAIR,
     MAKER_ORDER_TIMEOUT,
+    CHASE_INTERVAL_SEC, CHASE_MAX_ITERATIONS, MIN_CHASE_PROFIT_PCT,
+    TAKER_FEE_RATE, MAKER_FEE_RATE,
 )
 
 logger = logging.getLogger("pair_bot")
@@ -432,6 +434,351 @@ class OrderExecutor:
                     f"[{pair_prefix}] [Fallback 시장가도 실패!] {symbol}: {e2} — 수동 확인 필요!"
                 )
                 raise e2
+
+    # ── Maker-Chasing 엔진 (지정가 추적 → 100% Maker 체결) ────────────────────
+
+    async def chase_maker_order(
+        self, symbol: str, pair_prefix: str,
+        pos_info: dict = None,
+    ) -> dict:
+        """
+        지정가 추적(Limit Order Chasing) 엔진.
+
+        1. 현재 포지션 수량/방향 조회
+        2. 최우선 호가(Best Bid/Ask)에 지정가(Post-Only) 주문
+        3. CHASE_INTERVAL_SEC초 대기 후 체결 여부 확인
+        4. 미체결 → 기존 주문 취소 → 변경된 최우선 호가로 재주문
+        5. 매 반복마다 새 호가 기준 예상 PnL 가계산
+           → MIN_CHASE_PROFIT_PCT 미만이면 추적 포기 (ABORTED)
+        6. CHASE_MAX_ITERATIONS 도달 시에도 수익 마지노선 체크 후
+           통과 시만 시장가 Fallback, 미통과 시 ABORTED
+        7. 100% Maker 체결 시 결과 반환
+
+        pos_info: 외부에서 전달하는 포지션 정보 딕셔너리
+          {
+            "entry_price_a", "entry_price_b", "margin_a", "margin_b",
+            "qty_a", "qty_b", "side", "leg": "A"|"B"
+          }
+
+        반환값:
+          - 체결 성공: {"average":..., "qty":..., "maker":True, ...}
+          - 추적 포기: {"status": "ABORTED", "reason": "..."}
+        """
+        try:
+            # 포지션 조회
+            positions = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._exchange.fetch_positions([symbol])
+            )
+            pos = positions[0] if positions else {}
+            contracts = abs(float(pos.get("contracts", 0)))
+            if contracts == 0:
+                logger.info(f"[{pair_prefix}] [Chasing] {symbol} 보유 없음, 스킵")
+                return {"symbol": symbol, "average": 0.0, "fee": 0.0,
+                        "qty": 0.0, "side": "", "maker": True}
+
+            # 방향 결정
+            pos_side_raw = pos.get("side")
+            if pos_side_raw == "short":
+                close_side = "buy"
+            elif pos_side_raw == "long":
+                close_side = "sell"
+            else:
+                amt = float(pos.get("info", {}).get("positionAmt", 0))
+                close_side = "sell" if amt > 0 else "buy"
+
+            current_order_id = None
+
+            for iteration in range(1, CHASE_MAX_ITERATIONS + 1):
+                # 오더북 조회 → 최우선 호가 결정
+                ob = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: self._exchange.fetch_order_book(symbol, 5)
+                )
+                if close_side == "sell":
+                    # Long 청산 → Best Ask에 Sell Limit
+                    chase_price = ob["asks"][0][0] if ob.get("asks") else None
+                else:
+                    # Short 청산 → Best Bid에 Buy Limit
+                    chase_price = ob["bids"][0][0] if ob.get("bids") else None
+
+                if chase_price is None:
+                    logger.warning(
+                        f"[{pair_prefix}] [Chasing] {symbol} 호가 없음 (iter={iteration})"
+                    )
+                    await asyncio.sleep(CHASE_INTERVAL_SEC)
+                    continue
+
+                # ── 수익 마지노선 체크 (매 반복마다) ──
+                if pos_info:
+                    estimated_pnl_pct = self._estimate_chase_pnl(
+                        pos_info, symbol, chase_price
+                    )
+                    if estimated_pnl_pct < MIN_CHASE_PROFIT_PCT:
+                        # 추적 포기! 현재 걸려있는 주문 취소
+                        if current_order_id:
+                            try:
+                                await asyncio.get_running_loop().run_in_executor(
+                                    None, lambda: self._exchange.cancel_order(
+                                        current_order_id, symbol
+                                    )
+                                )
+                            except Exception:
+                                pass
+                        logger.warning(
+                            f"[{pair_prefix}] [Chasing ABORT] {symbol} "
+                            f"iter={iteration} | 예상 PnL={estimated_pnl_pct:+.2f}% "
+                            f"< 마지노선 {MIN_CHASE_PROFIT_PCT}% → 추적 포기 (Hold)"
+                        )
+                        return {
+                            "status": "ABORTED",
+                            "reason": f"예상 PnL {estimated_pnl_pct:+.2f}% < {MIN_CHASE_PROFIT_PCT}%",
+                            "symbol": symbol,
+                        }
+
+                # 기존 미체결 주문이 있으면 취소
+                if current_order_id:
+                    try:
+                        # 취소 전에 체결 여부 먼저 확인
+                        fetched = await asyncio.get_running_loop().run_in_executor(
+                            None, lambda: self._exchange.fetch_order(
+                                current_order_id, symbol
+                            )
+                        )
+                        if fetched.get("status") == "closed":
+                            logger.info(
+                                f"[{pair_prefix}] [Chasing 체결] {symbol} "
+                                f"iter={iteration} Maker 체결! ({iteration * CHASE_INTERVAL_SEC:.0f}초 소요)"
+                            )
+                            return await self._aggregate_trades_for_order(
+                                symbol, current_order_id, contracts,
+                                close_side, is_maker=True,
+                                pair_prefix=pair_prefix
+                            )
+                        # 미체결 → 취소
+                        await asyncio.get_running_loop().run_in_executor(
+                            None, lambda: self._exchange.cancel_order(
+                                current_order_id, symbol
+                            )
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"[{pair_prefix}] [Chasing] 주문 취소/조회 오류: {e}"
+                        )
+
+                # 새 호가에 지정가 주문 (Post-Only)
+                try:
+                    order = await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        lambda: self._exchange.create_order(
+                            symbol, "limit", close_side, contracts, chase_price,
+                            {"reduceOnly": True, "timeInForce": "GTX"}
+                        )
+                    )
+                    current_order_id = order["id"]
+                    logger.debug(
+                        f"[{pair_prefix}] [Chasing] {symbol} {close_side} "
+                        f"{contracts:.4f} @ {chase_price:.4f} "
+                        f"(iter={iteration}/{CHASE_MAX_ITERATIONS})"
+                    )
+                except Exception as e:
+                    # Post-Only 거부(이미 Taker 가격) 등 → 재시도
+                    logger.debug(
+                        f"[{pair_prefix}] [Chasing] 주문 실패 iter={iteration}: {e}"
+                    )
+                    current_order_id = None
+
+                # 체결 대기
+                await asyncio.sleep(CHASE_INTERVAL_SEC)
+
+                # 마지막 반복 후 체결 확인
+                if current_order_id:
+                    try:
+                        fetched = await asyncio.get_running_loop().run_in_executor(
+                            None, lambda: self._exchange.fetch_order(
+                                current_order_id, symbol
+                            )
+                        )
+                        if fetched.get("status") == "closed":
+                            logger.info(
+                                f"[{pair_prefix}] [Chasing 체결] {symbol} "
+                                f"Maker 체결 완료! (iter={iteration})"
+                            )
+                            return await self._aggregate_trades_for_order(
+                                symbol, current_order_id, contracts,
+                                close_side, is_maker=True,
+                                pair_prefix=pair_prefix
+                            )
+                    except Exception:
+                        pass
+
+            # ── 최대 추적 횟수 초과 → 최종 Fallback ──
+            # 미체결 주문 취소
+            if current_order_id:
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: self._exchange.cancel_order(
+                            current_order_id, symbol
+                        )
+                    )
+                except Exception:
+                    pass
+
+            # 최종 Fallback에서도 수익 마지노선 체크
+            if pos_info:
+                # 현재 시장 중간가 기준으로 PnL 재계산
+                ob = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: self._exchange.fetch_order_book(symbol, 5)
+                )
+                if close_side == "sell":
+                    fb_price = ob["bids"][0][0] if ob.get("bids") else 0
+                else:
+                    fb_price = ob["asks"][0][0] if ob.get("asks") else 0
+
+                if fb_price > 0:
+                    fb_pnl_pct = self._estimate_chase_pnl(
+                        pos_info, symbol, fb_price
+                    )
+                    if fb_pnl_pct < MIN_CHASE_PROFIT_PCT:
+                        logger.warning(
+                            f"[{pair_prefix}] [Chasing ABORT-Final] {symbol} "
+                            f"{CHASE_MAX_ITERATIONS}회 초과 + 시장가 PnL "
+                            f"{fb_pnl_pct:+.2f}% < {MIN_CHASE_PROFIT_PCT}% "
+                            f"→ 시장가도 포기, Hold"
+                        )
+                        return {
+                            "status": "ABORTED",
+                            "reason": f"최종 Fallback PnL {fb_pnl_pct:+.2f}% < {MIN_CHASE_PROFIT_PCT}%",
+                            "symbol": symbol,
+                        }
+
+            # 수익 마지노선 통과 → 시장가 Fallback
+            logger.warning(
+                f"[{pair_prefix}] [Chasing Fallback] {symbol} "
+                f"{CHASE_MAX_ITERATIONS}회 초과 → 수익 마지노선 통과, 시장가 청산"
+            )
+            return await self._close_real_position(symbol, pair_prefix)
+
+        except Exception as e:
+            logger.error(
+                f"[{pair_prefix}] [Chasing 예외] {symbol}: {e}"
+            )
+            # 예외 시에도 미체결 주문 정리 시도
+            if current_order_id:
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: self._exchange.cancel_order(
+                            current_order_id, symbol
+                        )
+                    )
+                except Exception:
+                    pass
+            # 예외 시 ABORTED 반환 (시장가로 긁지 않음)
+            return {
+                "status": "ABORTED",
+                "reason": f"Chasing 예외: {e}",
+                "symbol": symbol,
+            }
+
+    def _estimate_chase_pnl(
+        self, pos_info: dict, symbol: str, chase_price: float
+    ) -> float:
+        """
+        현재 추적 호가(chase_price) 기준으로 해당 레그의
+        페어 전체 예상 Net PnL(%)을 가계산합니다.
+
+        pos_info 필드:
+          entry_price_a, entry_price_b: 진입가
+          margin_a, margin_b: 레그별 증거금
+          qty_a, qty_b: 레그별 수량
+          side: "LONG_A_SHORT_B" | "SHORT_A_LONG_B"
+          leg: "A" | "B" - 이 함수를 호출하는 레그
+          current_price_other: 반대쪽 레그의 현재 가격 (없으면 진입가 사용)
+        """
+        entry_a = pos_info["entry_price_a"]
+        entry_b = pos_info["entry_price_b"]
+        qty_a = pos_info["qty_a"]
+        qty_b = pos_info["qty_b"]
+        margin_a = pos_info["margin_a"]
+        margin_b = pos_info["margin_b"]
+        side = pos_info["side"]
+        leg = pos_info["leg"]
+        other_price = pos_info.get("current_price_other")
+
+        # 이 레그가 chase_price로 체결될 때의 시뮬레이션 가격
+        if leg == "A":
+            sim_price_a = chase_price
+            sim_price_b = other_price if other_price else entry_b
+        else:
+            sim_price_a = other_price if other_price else entry_a
+            sim_price_b = chase_price
+
+        # Gross PnL 계산
+        if side == "LONG_A_SHORT_B":
+            pnl_a = qty_a * (sim_price_a - entry_a)
+            pnl_b = qty_b * (entry_b - sim_price_b)
+        else:  # SHORT_A_LONG_B
+            pnl_a = qty_a * (entry_a - sim_price_a)
+            pnl_b = qty_b * (sim_price_b - entry_b)
+
+        gross = pnl_a + pnl_b
+
+        # 수수료: 진입 Taker + 청산 Maker (Chasing이니까)
+        entry_notional = (qty_a * entry_a) + (qty_b * entry_b)
+        exit_notional = (qty_a * sim_price_a) + (qty_b * sim_price_b)
+        total_fee = (entry_notional * TAKER_FEE_RATE) + (exit_notional * MAKER_FEE_RATE)
+
+        net_pnl = gross - total_fee
+        total_margin = margin_a + margin_b
+
+        return (net_pnl / total_margin * 100) if total_margin > 0 else 0.0
+
+    async def close_pair_chase(
+        self,
+        sym_a: str, sym_b: str,
+        pair_prefix: str = "",
+        pos_info_a: dict = None,
+        pos_info_b: dict = None,
+    ) -> tuple:
+        """
+        두 레그를 병렬로 Maker-Chasing 청산합니다.
+
+        pos_info_a, pos_info_b: 각 레그의 PnL 가계산에 필요한 포지션 정보.
+          chase_maker_order에 전달됩니다.
+
+        페이퍼 모드: 기존 시장가 시뮬레이션으로 처리.
+
+        반환: (result_a, result_b)
+          - 각 result가 {"status": "ABORTED"} 이면 해당 레그 추적 포기
+        """
+        logger.info(
+            f"[{pair_prefix}] [Maker-Chasing 청산] A={sym_a}, B={sym_b}"
+        )
+
+        if IS_PAPER_TRADING:
+            pos_a = self._paper.positions.get(sym_a, {})
+            qty_a = pos_a.get("qty", 0.0)
+            price_a = pos_a.get("entry_price", 0.0)
+            pos_b = self._paper.positions.get(sym_b, {})
+            qty_b = pos_b.get("qty", 0.0)
+            price_b = pos_b.get("entry_price", 0.0)
+
+            pnl_a = self._paper.close_order(sym_a, price_a, pair_prefix)
+            pnl_b = self._paper.close_order(sym_b, price_b, pair_prefix)
+            total = pnl_a + pnl_b
+            logger.info(
+                f"[{pair_prefix}] [PAPER] Chasing 청산 완료 | "
+                f"총 PnL={total:+.4f} USDT | 잔고={self._paper.balance:.2f} USDT"
+            )
+            return (
+                {"average": price_a, "qty": qty_a, "maker": True},
+                {"average": price_b, "qty": qty_b, "maker": True},
+            )
+
+        results = await asyncio.gather(
+            self.chase_maker_order(sym_a, pair_prefix, pos_info=pos_info_a),
+            self.chase_maker_order(sym_b, pair_prefix, pos_info=pos_info_b),
+            return_exceptions=True,
+        )
+        return results
 
     # ── 내부 주문 처리 ────────────────────────────────────────────────────────
 

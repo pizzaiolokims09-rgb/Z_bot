@@ -99,8 +99,23 @@ class BotState:
         # 최신 단기 상관계수 캐시 {prefix: corr_value}
         self.latest_corr: Dict[str, float] = {}
 
+        # 최신 공적분 검정 p-value 캐시 {prefix: p_value}
+        self.latest_coint_pvalue: Dict[str, float] = {}
+
         # 감시 일시 정지 페어 집합 (paused → pair_loop에서 스킵)
         self.paused_pairs: Set[str] = set()
+
+        # ── 다이내믹 포트폴리오 스캐너 ────────────────────────────────────────
+        # 스캐너가 선발한 Top 15 페어 정보 리스트
+        # [{pair, sym_a, sym_b, corr, coint_pvalue, score}, ...]
+        self.dynamic_universe: list = []
+
+        # 마지막 스캔 완료 시각 (time.time())
+        self.last_scan_time: float = 0.0
+
+        # 스캔에서 빠졌지만 활성 포지션 보유 중인 '좀비' 페어 집합
+        # 포지션 청산 시 자연 소멸
+        self.zombie_pairs: Set[str] = set()
 
     # ── 통계 헬퍼 ─────────────────────────────────────────────────────────────
 

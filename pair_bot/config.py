@@ -157,9 +157,15 @@ MAKER_FEE_RATE = 0.0002   # 0.02%
 # 바이낸스 선물 최소 주문 명목가치 (USDT) — 이 미만이면 진입 스킵
 MIN_NOTIONAL_USDT = 5.5   # 실제 규칙 5 USDT, 여유분 포함 5.5
 
-# ── 지정가(Maker) 익절 설정 ──────────────────────────────────────────────────
+# ── 지정가(Maker) 익절 설정 (레거시 — Maker-Chasing 엔진으로 대체됨) ─────────
 # 지정가 익절 주문 후 미체결 시 시장가 Fallback 전환 대기 시간 (초)
-MAKER_ORDER_TIMEOUT = 5   # 60초에서 5초로 단축
+MAKER_ORDER_TIMEOUT = 5   # 레거시: close_pair_limit()용 (하위 호환 유지)
+
+# ── Maker-Chasing 엔진 설정 ─────────────────────────────────────────────────
+# 익절 시 최우선 호가를 추적하며 100% Maker 체결을 달성하는 비동기 루프
+CHASE_INTERVAL_SEC = 2.0       # 호가 추적 간격 (초)
+CHASE_MAX_ITERATIONS = 30      # 최대 추적 횟수 (30회 x 2초 = 최대 60초)
+MIN_CHASE_PROFIT_PCT = 0.5     # 추적 포기 마지노선: 예상 Net PnL이 이 % 미만이면 추적 중단 (Hold)
 
 # ── 서버 재구동 시 상태 복구 파일 ────────────────────────────────────────────
 STATE_FILE = "bot_state.json"
@@ -179,12 +185,18 @@ WARMUP_BATCH_SIZE = 5
 # 3초 폴링 x 4틱 = 12초 연속 유지 시 진입 승인 (극점 근처에서 날카로운 진입)
 ENTRY_CONFIRMATION_SEC = 12   # 12초 확인 매매 (30초 → 12초 단축, 4틱 연속)
 
-# ── 진입 시 상관계수 사전 검증 ────────────────────────────────────────────────
-# 진입 신호 발생 시 두 코인의 단기 상관계수가 이 값 이상이어야 최종 진입 승인
-# 디커플링 상태의 페어 진입을 원천 차단
-ENTRY_MIN_CORRELATION = 0.5    # 피어슨 상관계수 최소 0.5 (강한 동조화 확인)
+# ── 진입 시 상관계수 사전 검증 (레거시 — 스마트 손절에서만 사용) ──────────────
+# 진입 필터는 공적분 검정으로 교체됨 (아래 COINT_* 참조)
+# 이 값은 스마트 손절의 corr 임계치 비교에서 계속 참조
+ENTRY_MIN_CORRELATION = 0.5    # 피어슨 상관계수 최소 0.5 (레거시, 스마트 손절용 참조)
 
-# ── 섹터 제한형 스캐너 설정 ──────────────────────────────────────────────────
+# ── 공적분(Cointegration) 검정 설정 — 진입 필터 핵심 엔진 ────────────────────
+# statsmodels.tsa.stattools.coint (Engle-Granger 검정)의 p-value 기반
+# p-value <= 0.05 → 95% 신뢰수준으로 두 시계열의 평균 회귀성이 증명됨
+COINT_PVALUE_THRESHOLD = 0.05  # p-value 이하일 때만 진입 승인
+COINT_MIN_SAMPLES = 60         # 공적분 검정에 필요한 최소 시계열 샘플 수 (60분)
+
+# ── 섹터 제한형 스캐너 설정 (레거시 — 수동 스캔 기능 유지) ────────────────────
 # 스캐너가 작동할 때, 전체 시장이 아닌 선택된 섹터 안에서만 페어 조합을 검증
 SECTORS = {
     "L1_Major":  ["BTC", "ETH", "SOL", "AVAX"],
@@ -199,9 +211,26 @@ SECTORS = {
     "Meme":      ["DOGE", "1000SHIB", "1000PEPE", "1000BONK"],
 }
 
-# 스캔 파라미터
+# 섹터 스캔 파라미터 (레거시)
 SCAN_CORR_THRESHOLD = 0.7      # 상관계수 최소값
 SCAN_ADF_PVALUE     = 0.05     # ADF 검정 p-value 최대값 (공적분 유의수준)
 SCAN_DATA_HOURS     = 336      # 스캔 데이터 기간 (14일 x 24h = 336개 1h봉, 표본 N>=300 확보)
 SCAN_TIMEFRAME      = "1h"     # 스캔용 캔들 타임프레임
 SCAN_FETCH_DELAY    = 0.3      # 코인별 fetch_ohlcv 호출 간 딜레이 (초, Rate Limit 방어)
+
+# ── 다이내믹 포트폴리오 스캐너 설정 ──────────────────────────────────────────
+# 2시간마다 전체 선물 시장에서 최적 Top 15 페어를 자동 발굴하는 백그라운드 파이프라인
+SCANNER_INTERVAL_HOURS = 2        # 스캔 주기 (시간)
+SCANNER_TOP_N_COINS = 60          # Step 1: 24h 거래대금 상위 N개 코인
+SCANNER_CORR_THRESHOLD = 0.7      # Step 3: 피어슨 상관계수 최소값
+SCANNER_COINT_PVALUE = 0.05       # Step 4: 공적분 검정 p-value 최대값
+SCANNER_MAX_PAIRS = 15            # 최종 선발 페어 수
+SCANNER_OHLCV_TIMEFRAME = "15m"   # Step 2: OHLCV 봉 주기 (15분봉)
+SCANNER_OHLCV_LIMIT = 200         # Step 2: OHLCV 봉 개수 (200개 = ~50시간)
+SCANNER_FETCH_DELAY = 0.3         # 코인별 fetch_ohlcv 호출 간 딜레이 (초)
+SCANNER_CHUNK_SIZE = 5            # OHLCV 수집 배치 크기 (한 번에 5개씩)
+
+# 스캐너에서 제외할 코인 (스테이블코인, 레버리지 토큰, 래핑 토큰 등)
+SCANNER_EXCLUDE_COINS = {
+    "USDC", "BUSD", "TUSD", "FDUSD", "DAI", "USDD", "EUR",
+}

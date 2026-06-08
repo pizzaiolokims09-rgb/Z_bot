@@ -262,33 +262,8 @@ class TelegramNotifier:
                     cd_lines.append(f"  • [{p}] 🚫 {time_str} 남음")
             cd_text = "\n".join(cd_lines) if cd_lines else "  없음"
 
-            # ── 감시 유니버스 (페어별 승률 + 상관계수) ──
-            from config import PAIRS_TO_TRADE
-            _coin_to_sector = {}
-            for sec_name, coins in SECTORS.items():
-                for c in coins:
-                    _coin_to_sector[c] = sec_name
-
-            sector_pairs = {}
-            uncategorized = []
-            seen_prefixes = set()
-            for sym_a, sym_b in PAIRS_TO_TRADE:
-                a_base = sym_a.split("/")[0]
-                b_base = sym_b.split("/")[0]
-                prefix = f"{a_base}-{b_base}"
-                if prefix in seen_prefixes:
-                    continue
-                seen_prefixes.add(prefix)
-                if prefix in self._state.paused_pairs:
-                    continue
-                sec_a = _coin_to_sector.get(a_base, "")
-                sec_b = _coin_to_sector.get(b_base, "")
-                sec = sec_a or sec_b or ""
-                if sec:
-                    sector_pairs.setdefault(sec, []).append(prefix)
-                else:
-                    uncategorized.append(prefix)
-
+            # ── 🔥 다이내믹 Top 15 유니버스 ──
+            import time as _time
             def _pair_info(p: str) -> str:
                 stats = self._state.pair_stats.get(p, {"win": 0, "lose": 0})
                 w = stats.get("win", 0)
@@ -296,19 +271,42 @@ class TelegramNotifier:
                 total = w + l
                 wr = (w / total * 100) if total > 0 else 0.0
                 corr_val = self._state.latest_corr.get(p)
-                corr_str = f"{corr_val:+.2f}" if corr_val is not None else "대기 중"
-                return f"▶️ {p} (승률: {wr:.1f}% ({w}승 {l}패) | Corr: {corr_str})"
+                corr_str = f"{corr_val:+.2f}" if corr_val is not None else "-.--"
+                return f"({wr:.0f}% {w}W{l}L | Corr:{corr_str})"
 
             univ_lines = []
-            for sec_name, prefixes in sector_pairs.items():
-                univ_lines.append(f"  [{sec_name}]")
-                for p in prefixes:
-                    univ_lines.append(f"    {_pair_info(p)}")
-            if uncategorized:
-                univ_lines.append(f"  [기타]")
-                for p in uncategorized:
-                    univ_lines.append(f"    {_pair_info(p)}")
-            univ_text = "\n".join(univ_lines) if univ_lines else "  없음"
+            if self._state.dynamic_universe:
+                for i, pu in enumerate(self._state.dynamic_universe, 1):
+                    pf = pu["pair"]
+                    is_zombie = pf in self._state.zombie_pairs
+                    is_paused = pf in self._state.paused_pairs
+                    mark = "🧟" if is_zombie else ("⏸" if is_paused else "✅")
+                    info = _pair_info(pf)
+                    univ_lines.append(
+                        f"  {i:2d}. {mark} {pf} "
+                        f"(c={pu['corr']:.2f}|p={pu['coint_pvalue']:.3f}) "
+                        f"{info}"
+                    )
+            else:
+                # 아직 스캔 전 — 하드코딩 PAIRS_TO_TRADE에서 표시
+                from config import PAIRS_TO_TRADE
+                seen_p = set()
+                for sym_a, sym_b in PAIRS_TO_TRADE:
+                    pf = f"{sym_a.split('/')[0]}-{sym_b.split('/')[0]}"
+                    if pf in seen_p or pf in self._state.paused_pairs:
+                        continue
+                    seen_p.add(pf)
+                    info = _pair_info(pf)
+                    univ_lines.append(f"  ▶️ {pf} {info}")
+
+            scan_ago = ""
+            if self._state.last_scan_time > 0:
+                elapsed = int(_time.time() - self._state.last_scan_time)
+                h, m = elapsed // 3600, (elapsed % 3600) // 60
+                scan_ago = f" (최근 스캔: {h}h {m}m 전)"
+
+            univ_text = "\n".join(univ_lines) if univ_lines else "  대기 중 (첫 스캔 준비 중)"
+            active_count = len(univ_lines)
 
             paused_lines = []
             for p in sorted(self._state.paused_pairs):
@@ -320,21 +318,19 @@ class TelegramNotifier:
                 paused_lines.append(f"  🔴 {p} ({wr:.1f}% | {w}승 {l}패)")
             paused_text = "\n".join(paused_lines) if paused_lines else "  없음"
 
-            swap_lines = []
-            for old_p, (new_a, new_b) in self._state.pending_swaps.items():
-                new_p = f"{new_a.split('/')[0]}-{new_b.split('/')[0]}"
-                swap_lines.append(f"  • [{old_p}] → [{new_p}]")
-            swap_text = "\n".join(swap_lines) if swap_lines else "  없음"
+            zombie_lines = []
+            for zp in sorted(self._state.zombie_pairs):
+                zombie_lines.append(f"  🧟 {zp} (포지션 보유 → 청산 시 자동 제거)")
+            zombie_text = "\n".join(zombie_lines) if zombie_lines else "  없음"
 
-            active_count = len(seen_prefixes) - len(self._state.paused_pairs)
             await update.message.reply_text(
                 f"📊 봇 상태: {status_str}\n"
                 f"가용 잔고: {bal_str}\n\n"
                 f"활성 포지션 ({len(self._state.positions)}개):\n{pos_text}\n\n"
                 f"블랙리스트 (쿨다운 중):\n{cd_text}\n\n"
-                f"🔭 감시 유니버스 ({active_count}개 활성):\n{univ_text}\n\n"
-                f"🚫 감시 일시 정지됨 (Paused):\n{paused_text}\n\n"
-                f"⏳ 교체 예약 (Pending Swap):\n{swap_text}",
+                f"🔥 다이내믹 Top 15 유니버스{scan_ago} ({active_count}개):\n{univ_text}\n\n"
+                f"🧟 좀비 페어 (청산 대기):\n{zombie_text}\n\n"
+                f"🚫 감시 일시 정지됨 (Paused):\n{paused_text}",
                 reply_markup=self._reply_keyboard(),
             )
 
