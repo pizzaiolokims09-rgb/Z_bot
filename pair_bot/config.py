@@ -234,3 +234,81 @@ SCANNER_CHUNK_SIZE = 5            # OHLCV 수집 배치 크기 (한 번에 5개�
 SCANNER_EXCLUDE_COINS = {
     "USDC", "BUSD", "TUSD", "FDUSD", "DAI", "USDD", "EUR",
 }
+
+# ── 포트폴리오 분산 필터 ─────────────────────────────────────────────────────
+# 한 코인이 최종 Top 15 페어 내에 등장할 수 있는 최대 횟수
+# 2 = 한 코인은 최대 2개 페어에만 포함 가능 (쏠림 방지)
+MAX_PAIRS_PER_COIN = 2
+
+# ── 섹터 동조화 필터 (이종 교배 차단) ────────────────────────────────────────
+# 같은 섹터끼리, 또는 Macro(BTC/ETH)와의 조합만 허용
+# 분류되지 않은 코인은 자동으로 "ETC" 처리
+SECTOR_MAP = {
+    # Macro (모든 코인과 페어링 가능)
+    "BTC":       "Macro",
+    "ETH":       "Macro",
+    # Layer 1
+    "SOL":       "L1",
+    "AVAX":      "L1",
+    "ADA":       "L1",
+    "TRX":       "L1",
+    "TON":       "L1",
+    "NEAR":      "L1",
+    "SUI":       "L1",
+    "APT":       "L1",
+    "SEI":       "L1",
+    "INJ":       "L1",
+    "ATOM":      "L1",
+    "TIA":       "L1",
+    "POL":       "L1",
+    "HBAR":      "L1",
+    "ALGO":      "L1",
+    "FTM":       "L1",
+    "KAIA":      "L1",
+    # Layer 2
+    "ARB":       "L2",
+    "OP":        "L2",
+    "STRK":      "L2",
+    "ZK":        "L2",
+    # DeFi
+    "UNI":       "DeFi",
+    "AAVE":      "DeFi",
+    "LINK":      "DeFi",
+    "DOT":       "DeFi",
+    "MKR":       "DeFi",
+    "CRV":       "DeFi",
+    "PENDLE":    "DeFi",
+    "ENA":       "DeFi",
+    # AI
+    "RENDER":    "AI",
+    "FET":       "AI",
+    "WLD":       "AI",
+    "ARKM":      "AI",
+    "TAO":       "AI",
+    "AKT":       "AI",
+    # Meme
+    "DOGE":      "Meme",
+    "1000SHIB":  "Meme",
+    "1000PEPE":  "Meme",
+    "1000BONK":  "Meme",
+    "WIF":       "Meme",
+    "FLOKI":     "Meme",
+    "PEOPLE":    "Meme",
+    "NEIRO":     "Meme",
+    "TRUMP":     "Meme",
+    # Storage
+    "FIL":       "Storage",
+    "AR":        "Storage",
+    # Payment
+    "XRP":       "Payment",
+    "XLM":       "Payment",
+    "LTC":       "Payment",
+    "BCH":       "Payment",
+    # BTC Ecosystem
+    "STX":       "BTC_Eco",
+    "ORDI":      "BTC_Eco",
+    # GameFi
+    "IMX":       "GameFi",
+    "GALA":      "GameFi",
+    "AXS":       "GameFi",
+}

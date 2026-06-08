@@ -22,6 +22,8 @@ from config import (
     SCANNER_FETCH_DELAY,
     SCANNER_CHUNK_SIZE,
     SCANNER_EXCLUDE_COINS,
+    MAX_PAIRS_PER_COIN,
+    SECTOR_MAP,
 )
 
 logger = logging.getLogger("pair_bot")
@@ -34,8 +36,8 @@ class DynamicScanner:
 
     Step 1: 거래대금 상위 60개 우량주 필터
     Step 2: 15분봉 200개 OHLCV 데이터 수집
-    Step 3: 피어슨 상관계수 >= 0.7 고속 필터
-    Step 4: 공적분 검정 p-value <= 0.05 오디션 → Top 15 선발
+    Step 3: 섹터 동조화 필터 + 피어슨 상관계수 >= 0.7 고속 필터
+    Step 4: 공적분 검정 p-value <= 0.05 오디션 + 코인 중복 제한 → Top 15 선발
     """
 
     # ── 메인 진입점 ───────────────────────────────────────────────────────────
@@ -184,12 +186,14 @@ class DynamicScanner:
     @staticmethod
     def _blocking_scan(prices: Dict[str, np.ndarray]) -> List[dict]:
         """
-        Step 3: 피어슨 상관계수 >= 0.7 필터 (고속)
-        Step 4: 공적분 검정 p-value <= 0.05 오디션 → Top N 선발
+        Step 3: 섹터 동조화 필터 + 피어슨 상관계수 >= 0.7 필터 (고속)
+        Step 4: 공적분 검정 p-value <= 0.05 오디션
+                + 코인 중복 출현 제한 (MAX_PAIRS_PER_COIN) → Top N 선발
 
         이 함수는 동기 함수이며, asyncio.to_thread()로 별도 스레드에서 실행됩니다.
         """
         from statsmodels.tsa.stattools import coint
+        from collections import defaultdict
 
         coins = list(prices.keys())
         total_combos = len(coins) * (len(coins) - 1) // 2
@@ -198,9 +202,20 @@ class DynamicScanner:
             f"{len(coins)}개 코인 × {total_combos}개 조합"
         )
 
-        # Step 3: 상관계수 고속 필터
+        # ── Step 3: 섹터 동조화 필터 + 상관계수 고속 필터 ──
+        # 허용 조건: (1) 같은 섹터끼리 OR (2) 한쪽이 Macro(BTC/ETH)
         corr_passed = []
+        sector_skipped = 0
         for coin_a, coin_b in itertools.combinations(coins, 2):
+            # 섹터 동조화 필터 (이종 교배 차단)
+            sec_a = SECTOR_MAP.get(coin_a, "ETC")
+            sec_b = SECTOR_MAP.get(coin_b, "ETC")
+            same_sector = (sec_a == sec_b)
+            has_macro = (sec_a == "Macro" or sec_b == "Macro")
+            if not same_sector and not has_macro:
+                sector_skipped += 1
+                continue
+
             arr_a = prices[coin_a]
             arr_b = prices[coin_b]
 
@@ -216,6 +231,7 @@ class DynamicScanner:
 
         logger.info(
             f"[DynScanner] Step 3 완료 | "
+            f"섹터 필터로 {sector_skipped}개 이종 조합 차단 | "
             f"상관계수 >= {SCANNER_CORR_THRESHOLD} 통과: "
             f"{len(corr_passed)}개 페어"
         )
@@ -223,8 +239,8 @@ class DynamicScanner:
         if not corr_passed:
             return []
 
-        # Step 4: 공적분 오디션
-        results = []
+        # ── Step 4: 공적분 오디션 ──
+        coint_candidates = []
         for coin_a, coin_b, a, b, corr in corr_passed:
             try:
                 _, pvalue, _ = coint(a, b)
@@ -238,23 +254,59 @@ class DynamicScanner:
             # 종합 점수: 상관계수 높을수록 + p-value 낮을수록 좋음
             score = abs(corr) * (1.0 - pvalue)
 
-            results.append({
+            coint_candidates.append({
                 "pair": f"{coin_a}-{coin_b}",
                 "sym_a": f"{coin_a}/USDT",
                 "sym_b": f"{coin_b}/USDT",
+                "coin_a": coin_a,
+                "coin_b": coin_b,
                 "corr": round(corr, 4),
                 "coint_pvalue": round(pvalue, 4),
                 "score": round(score, 4),
                 "data_points": min(len(a), len(b)),
             })
 
-        # score 내림차순 정렬 → 상위 SCANNER_MAX_PAIRS개
-        results.sort(key=lambda x: x["score"], reverse=True)
-        results = results[:SCANNER_MAX_PAIRS]
+        # score 내림차순 정렬
+        coint_candidates.sort(key=lambda x: x["score"], reverse=True)
 
         logger.info(
-            f"[DynScanner] Step 4 완료 | "
-            f"공적분 p<={SCANNER_COINT_PVALUE} 통과 → "
+            f"[DynScanner] Step 4-A | "
+            f"공적분 p<={SCANNER_COINT_PVALUE} 통과: "
+            f"{len(coint_candidates)}개 후보"
+        )
+
+        # ── 코인 중복 출현 제한 (포트폴리오 분산) ──
+        # score 순서대로 뽑되, 한 코인이 MAX_PAIRS_PER_COIN 초과하면 Skip
+        coin_count: Dict[str, int] = defaultdict(int)
+        results = []
+        skipped_by_limit = 0
+
+        for cand in coint_candidates:
+            ca = cand["coin_a"]
+            cb = cand["coin_b"]
+
+            # 어느 한쪽이라도 한도 초과 시 Skip
+            if (coin_count[ca] >= MAX_PAIRS_PER_COIN or
+                    coin_count[cb] >= MAX_PAIRS_PER_COIN):
+                skipped_by_limit += 1
+                continue
+
+            # 선발 확정 → 카운트 증가
+            coin_count[ca] += 1
+            coin_count[cb] += 1
+
+            # 최종 결과에서 내부용 키 제거
+            result = {k: v for k, v in cand.items()
+                      if k not in ("coin_a", "coin_b")}
+            results.append(result)
+
+            if len(results) >= SCANNER_MAX_PAIRS:
+                break
+
+        logger.info(
+            f"[DynScanner] Step 4-B 완료 | "
+            f"코인 분산 필터(MAX={MAX_PAIRS_PER_COIN})로 "
+            f"{skipped_by_limit}개 Skip | "
             f"최종 {len(results)}개 선발"
         )
         return results
