@@ -87,6 +87,9 @@ class BotState:
 
         # 스캔 진행 중 플래그 (중복 스캔 방지)
         self.scan_in_progress: bool = False
+        
+        # 텔레그램을 통한 강제 스캔 요청 플래그
+        self.force_scan: bool = False
 
         # 런타임 페어 리스트 오버라이드 (bot_state.json에 저장/복구)
         # 서버 재시작 시 config.py 하드코딩 리스트 대신 이 리스트를 사용

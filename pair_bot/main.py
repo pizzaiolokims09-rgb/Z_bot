@@ -1218,7 +1218,13 @@ async def dynamic_scanner_loop(
 
     while True:
         try:
+            # 텔레그램에서 강제 스캔 요청이 들어온 경우 플래그 해제
+            if bot_state.force_scan:
+                bot_state.force_scan = False
+                logger.info("[DynScanner] 텔레그램 강제 스캔 요청 감지!")
+            
             logger.info("[DynScanner] ═══ 스캔 사이클 시작 ═══")
+            bot_state.scan_in_progress = True
 
             # 스캔 전용 exchange (공용 API, 키 불필요)
             import ccxt.async_support as _ccxt
@@ -1239,7 +1245,8 @@ async def dynamic_scanner_loop(
                 logger.warning(
                     "[DynScanner] 유효 페어 없음 — 기존 유니버스 유지"
                 )
-                await asyncio.sleep(interval_sec)
+                bot_state.scan_in_progress = False
+                await _wait_for_next_scan(interval_sec, bot_state)
                 continue
 
             # ── 결과를 bot_state에 캐시 ──
@@ -1384,8 +1391,20 @@ async def dynamic_scanner_loop(
             logger.error(
                 f"[DynScanner] 스캔 사이클 오류: {e}", exc_info=True
             )
+        finally:
+            bot_state.scan_in_progress = False
 
-        await asyncio.sleep(interval_sec)
+        await _wait_for_next_scan(interval_sec, bot_state)
+
+
+async def _wait_for_next_scan(interval_sec: int, bot_state):
+    """지정된 시간 동안 대기하되, 강제 스캔 요청이 오면 즉시 대기를 중단합니다."""
+    waited = 0
+    while waited < interval_sec:
+        if bot_state.force_scan:
+            break
+        await asyncio.sleep(5)
+        waited += 5
 
 
 # ─────────────────────────────────────────────────────────────────────────────

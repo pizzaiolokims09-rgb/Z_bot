@@ -56,7 +56,7 @@ class TelegramNotifier:
     BTN_RESUME  = "▶️ 봇 재시작"
     BTN_STATUS  = "📊 상태 확인"
     BTN_STATS   = "💰 승률 & PnL"
-    BTN_SCAN    = "🔍 페어 스캔"
+    BTN_SCAN    = "🔄 페어 강제 스캔"
     BTN_MANAGE  = "⚙️ 페어 관리"
 
     def _reply_keyboard(self) -> ReplyKeyboardMarkup:
@@ -345,20 +345,14 @@ class TelegramNotifier:
                     reply_markup=self._reply_keyboard(),
                 )
                 return
-            # 섹터 선택 인라인 키보드
-            buttons = []
-            sector_names = list(SECTORS.keys())
-            for i in range(0, len(sector_names), 2):
-                row = [InlineKeyboardButton(
-                    f"🎨 {s} ({len(SECTORS[s])})",
-                    callback_data=f"scan_sector:{s}"
-                ) for s in sector_names[i:i+2]]
-                buttons.append(row)
-            buttons.append([InlineKeyboardButton("❌ 취소", callback_data="scan_cancel")])
+            
+            # 다이내믹 스캐너 강제 실행 플래그 On
+            self._state.force_scan = True
+            
             await update.message.reply_text(
-                "🔍 스캔할 섹터를 선택하세요:\n"
-                "(선택한 섹터 내의 코인 조합만 검증합니다)",
-                reply_markup=InlineKeyboardMarkup(buttons),
+                "🚀 [다이내믹 스캐너] 강제 스캔을 요청했습니다!\n"
+                "백그라운드에서 최대 1~2분 소요될 수 있으며, 완료 시 결과 알림이 전송됩니다.",
+                reply_markup=self._reply_keyboard(),
             )
 
         elif text == self.BTN_STATS:
