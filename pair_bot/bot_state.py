@@ -120,6 +120,11 @@ class BotState:
         # 포지션 청산 시 자연 소멸
         self.zombie_pairs: Set[str] = set()
 
+        # 다이내믹 스캐너 사전 워밍업 캐시
+        # pre_warmup_pair()가 채운 SpreadEngine을 pair_loop에 전달
+        # {prefix: SpreadEngine} — pair_loop가 소비하면 즉시 삭제
+        self.prewarmed_engines: dict = {}
+
     # ── 통계 헬퍼 ─────────────────────────────────────────────────────────────
 
     def record_trade(self, pnl_usdt: float, prefix: str = "") -> None:

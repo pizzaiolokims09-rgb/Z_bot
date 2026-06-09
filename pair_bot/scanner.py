@@ -8,6 +8,7 @@
 import asyncio
 import itertools
 import logging
+import re
 from typing import List, Dict
 
 import numpy as np
@@ -28,13 +29,16 @@ from config import (
 
 logger = logging.getLogger("pair_bot")
 
+# 유효한 코인 심볼: 영문 대문자 + 숫자만 허용 (1000PEPE 등 가능)
+_VALID_BASE_RE = re.compile(r"^[A-Z0-9]+$")
+
 
 class DynamicScanner:
     """
     4단계 파이프라인으로 전체 바이낸스 선물 시장에서
     최적의 페어 트레이딩 후보를 자동 발굴합니다.
 
-    Step 1: 거래대금 상위 60개 우량주 필터
+    Step 1: 거래대금 상위 60개 우량주 필터 + 티커 위생 검사
     Step 2: 15분봉 200개 OHLCV 데이터 수집
     Step 3: 섹터 동조화 필터 + 피어슨 상관계수 >= 0.7 고속 필터
     Step 4: 공적분 검정 p-value <= 0.05 오디션 + 코인 중복 제한 → Top 15 선발
@@ -88,7 +92,7 @@ class DynamicScanner:
         """
         바이낸스 선물의 전체 티커를 조회하여
         24시간 거래대금(quoteVolume) 상위 N개 코인의 base 심볼을 반환합니다.
-        스테이블코인, 레버리지 토큰 등은 제외합니다.
+        스테이블코인, 레버리지 토큰, 주식/ETF, 특수문자 티커 등을 제외합니다.
         """
         try:
             tickers = await exchange.fetch_tickers()
@@ -98,6 +102,7 @@ class DynamicScanner:
 
         # USDT 페어만 추출 + 거래대금 기준 정렬
         candidates = []
+        hygiene_rejected = 0
         for symbol, ticker in tickers.items():
             # 선물 심볼 형식: BTC/USDT:USDT
             if not symbol.endswith("/USDT:USDT"):
@@ -105,9 +110,16 @@ class DynamicScanner:
 
             base = symbol.split("/")[0]
 
-            # 제외 필터: 스테이블코인, 레버리지 토큰(UP, DOWN, BULL, BEAR)
+            # 위생 필터 1: 영문 대문자 + 숫자만 허용 (하이픈, 밑줄, 한자, 공백 등 차단)
+            if not _VALID_BASE_RE.match(base):
+                hygiene_rejected += 1
+                continue
+
+            # 위생 필터 2: 블랙리스트 (스테이블, 주식, 테스트넷 토큰)
             if base in SCANNER_EXCLUDE_COINS:
                 continue
+
+            # 위생 필터 3: 레버리지 토큰 접미사
             if any(base.endswith(suffix) for suffix in
                    ("UP", "DOWN", "BULL", "BEAR")):
                 continue
@@ -117,6 +129,11 @@ class DynamicScanner:
                 continue
 
             candidates.append((base, quote_vol))
+
+        if hygiene_rejected > 0:
+            logger.debug(
+                f"[DynScanner] 위생 필터로 {hygiene_rejected}개 비정상 티커 제거"
+            )
 
         # 거래대금 내림차순 정렬 → 상위 N개
         candidates.sort(key=lambda x: x[1], reverse=True)

@@ -474,6 +474,75 @@ async def prefetch_warmup_data(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 다이내믹 스캐너 전용: 즉시 주입 워밍업 (워밍업 트랩 파괴)
+# ─────────────────────────────────────────────────────────────────────────────
+async def pre_warmup_pair(
+    exchange: ccxt_async.Exchange, sym_a: str, sym_b: str,
+    prefix: str, bot_state: BotState,
+) -> bool:
+    """
+    스캐너가 새 페어를 발굴할 때 pair_loop 생성 직전에 호출합니다.
+    1분봉 1440개(24시간)를 가져와 SpreadEngine에 주입한 뒤,
+    이 SpreadEngine을 pair_loop가 재사용하도록 bot_state에 캐싱합니다.
+    
+    pair_loop는 시작 시 이 캐시를 발견하면 자체 워밍업을 스킵하고
+    즉시 매매 감시 루프에 진입합니다.
+    
+    반환: True=성공, False=실패 (pair_loop가 자체 워밍업 수행)
+    """
+    logger = logging.getLogger("pair_bot")
+    try:
+        futures_a = to_futures_symbol(sym_a)
+        futures_b = to_futures_symbol(sym_b)
+        limit = 1440  # 24시간 = 1440분
+
+        ohlcv_a, ohlcv_b = await asyncio.gather(
+            exchange.fetch_ohlcv(futures_a, timeframe="1m", limit=limit),
+            exchange.fetch_ohlcv(futures_b, timeframe="1m", limit=limit),
+            return_exceptions=True,
+        )
+
+        if isinstance(ohlcv_a, Exception) or isinstance(ohlcv_b, Exception):
+            logger.warning(f"[PreWarmup][{prefix}] OHLCV 조회 실패 - pair_loop 자체 워밍업으로 대체")
+            return False
+
+        if not ohlcv_a or not ohlcv_b:
+            logger.warning(f"[PreWarmup][{prefix}] OHLCV 데이터 없음")
+            return False
+
+        min_len = min(len(ohlcv_a), len(ohlcv_b))
+        ohlcv_a = ohlcv_a[-min_len:]
+        ohlcv_b = ohlcv_b[-min_len:]
+
+        # SpreadEngine을 미리 생성하여 윈도우를 100% 채움
+        engine = SpreadEngine()
+        for i in range(min_len):
+            price_a = ohlcv_a[i][4]
+            price_b = ohlcv_b[i][4]
+            if price_b > 0:
+                # 1분(60초) = 3초 폴링 * 20회 반복 삽입
+                for _ in range(20):
+                    engine.update(price_a, price_b)
+
+            # 이벤트 루프 블로킹 방지
+            if i % 100 == 0:
+                await asyncio.sleep(0)
+
+        # bot_state에 캐싱 → pair_loop가 이 엔진을 가져다 씀
+        bot_state.prewarmed_engines[prefix] = engine
+
+        logger.info(
+            f"[PreWarmup][{prefix}] 즉시 주입 완료 | "
+            f"{min_len}분 데이터 → window={engine.window_size} | "
+            f"즉시 매매 가능 상태로 pair_loop 시작"
+        )
+        return True
+
+    except Exception as e:
+        logger.warning(f"[PreWarmup][{prefix}] 사전 워밍업 오류: {e}")
+        return False
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 피어슨 상관계수 헬퍼 (스마트 손절용 — 유지)
 # ─────────────────────────────────────────────────────────────────────────────
 def calc_pearson_corr(prices_a: deque, prices_b: deque) -> float:
@@ -572,7 +641,14 @@ async def pair_loop(
     sym_b  = to_futures_symbol(raw_sym_b)
     prefix = make_prefix(raw_sym_a, raw_sym_b)
 
-    spread_engine = SpreadEngine()   # 이 페어 전용 Z-Score 계산기
+    # ── 사전 워밍업 캐시 확인 (다이내믹 스캐너 경유 시 즉시 매매 가능) ──
+    cached_engine = bot_state.prewarmed_engines.pop(prefix, None)
+    if cached_engine is not None:
+        spread_engine = cached_engine  # 이미 24시간치 데이터로 100% 채워진 엔진
+        logger.info(f"[{prefix}] 사전 워밍업 캐시 사용 → 즉시 매매 가능!")
+    else:
+        spread_engine = SpreadEngine()  # 이 페어 전용 Z-Score 계산기
+
     risk_manager  = RiskManager()    # 이 페어 전용 포지션 상태
 
     entry_timestamp = 0.0      # 포지션 진입 시각 (time.time() 기반, 시간 기반 청산용)
@@ -601,11 +677,12 @@ async def pair_loop(
         except Exception as e:
             logger.error(f"[{prefix}] 진입 시간 복구 실패: {e}")
 
-    # ── 워밍업 데이터 프리패치 ──
-    await prefetch_warmup_data(
-        exchange, sym_a, sym_b, spread_engine, prefix,
-        corr_prices_a=corr_prices_a, corr_prices_b=corr_prices_b
-    )
+    # ── 워밍업 데이터 프리패치 (캐시 없는 경우에만) ──
+    if cached_engine is None:
+        await prefetch_warmup_data(
+            exchange, sym_a, sym_b, spread_engine, prefix,
+            corr_prices_a=corr_prices_a, corr_prices_b=corr_prices_b
+        )
 
     while True:
         try:
@@ -1314,10 +1391,14 @@ async def dynamic_scanner_loop(
                     f"{', '.join(cleared_zombies)}"
                 )
 
-            # ── 2) 새 페어 추가 (pair_loop Task 생성) ──
+            # ── 2) 새 페어 추가 (사전 워밍업 + pair_loop Task 생성) ──
             added_count = 0
             for pf in to_add:
                 sym_a, sym_b = new_pair_map[pf]
+                
+                # 워밍업 트랩 파괴: pair_loop 시작 전 24시간치 데이터 즉시 주입
+                await pre_warmup_pair(exchange, sym_a, sym_b, pf, bot_state)
+                
                 task = asyncio.create_task(
                     pair_loop(
                         sym_a, sym_b, exchange,

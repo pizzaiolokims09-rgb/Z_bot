@@ -230,15 +230,23 @@ SCANNER_OHLCV_LIMIT = 200         # Step 2: OHLCV 봉 개수 (200개 = ~50시간
 SCANNER_FETCH_DELAY = 0.3         # 코인별 fetch_ohlcv 호출 간 딜레이 (초)
 SCANNER_CHUNK_SIZE = 5            # OHLCV 수집 배치 크기 (한 번에 5개씩)
 
-# 스캐너에서 제외할 코인 (스테이블코인, 레버리지 토큰, 래핑 토큰 등)
+# 스캐너에서 제외할 코인 (스테이블코인, 레버리지 토큰, 래핑 토큰, 주식/ETF 등)
 SCANNER_EXCLUDE_COINS = {
-    "USDC", "BUSD", "TUSD", "FDUSD", "DAI", "USDD", "EUR",
+    # 스테이블코인
+    "USDC", "BUSD", "TUSD", "FDUSD", "DAI", "USDD", "EUR", "USDP",
+    # 래핑/브릿지 토큰
+    "WBTC", "WETH", "WBETH", "STETH", "CBETH",
+    # 주식/ETF (바이낸스 테스트넷에 간혹 등장)
+    "SOXL", "QQQ", "INTC", "EWY", "SKHYNIX", "AAPL", "TSLA",
+    "AMZN", "MSFT", "GOOG", "NVDA", "META", "NFLX", "AMD",
+    # 테스트넷/데모 전용 토큰
+    "CRCL", "PUMP", "ONDO",
 }
 
 # ── 포트폴리오 분산 필터 ─────────────────────────────────────────────────────
 # 한 코인이 최종 Top 15 페어 내에 등장할 수 있는 최대 횟수
 # 2 = 한 코인은 최대 2개 페어에만 포함 가능 (쏠림 방지)
-MAX_PAIRS_PER_COIN = 2
+MAX_PAIRS_PER_COIN = 1
 
 # ── 섹터 동조화 필터 (이종 교배 차단) ────────────────────────────────────────
 # 같은 섹터끼리, 또는 Macro(BTC/ETH)와의 조합만 허용
