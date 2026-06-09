@@ -885,6 +885,13 @@ class TelegramNotifier:
             logger.debug(f"[텔레그램] 토큰 미설정, 로컬 로그만: {text[:60]}")
             return
         try:
-            await self._app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+            # 텔레그램 타임아웃 방지 (긴 메시지, 네트워크 지연 대응)
+            await self._app.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID, 
+                text=text, 
+                read_timeout=60, 
+                write_timeout=60, 
+                connect_timeout=60
+            )
         except TelegramError as e:
             logger.warning(f"[텔레그램] 전송 실패: {e}")

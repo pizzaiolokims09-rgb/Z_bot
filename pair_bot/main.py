@@ -833,6 +833,8 @@ async def pair_loop(
 
                 # ── 30초 확인 매매 필터 (Whipsaw Prevention) ──────────────────
                 now_ts = time.time()
+                entry_corr = bot_state.latest_corr.get(prefix, 1.0)
+                
                 if entry_confirm_ts == 0.0:
                     # Z-Score가 진입 문턴을 처음 넘은 시점 → 타이머 시작
                     entry_confirm_ts = now_ts

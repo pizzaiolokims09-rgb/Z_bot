@@ -580,6 +580,9 @@ class OrderExecutor:
                         f"(iter={iteration}/{CHASE_MAX_ITERATIONS})"
                     )
                 except Exception as e:
+                    if "-2022" in str(e) or "ReduceOnly Order is rejected" in str(e):
+                        logger.warning(f"[{pair_prefix}] [Chasing] {symbol} 이미 청산됨(-2022). 강제 성공 처리.")
+                        return {"symbol": symbol, "average": 0.0, "fee": 0.0, "qty": contracts, "side": close_side, "maker": False}
                     # Post-Only 거부(이미 Taker 가격) 등 → 재시도
                     logger.debug(
                         f"[{pair_prefix}] [Chasing] 주문 실패 iter={iteration}: {e}"
@@ -913,7 +916,10 @@ class OrderExecutor:
                         )
                     )
                 except Exception as me:
-                    if "-4131" in str(me) or "PERCENT_PRICE" in str(me):
+                    if "-2022" in str(me) or "ReduceOnly Order is rejected" in str(me):
+                        logger.warning(f"[{pair_prefix}] [ReduceOnly 거절] {symbol} 이미 거래소에서 청산됨(-2022). 강제 성공 처리.")
+                        return {"symbol": symbol, "average": 0.0, "fee": 0.0, "qty": contracts, "side": close_side, "maker": False}
+                    elif "-4131" in str(me) or "PERCENT_PRICE" in str(me):
                         logger.warning(f"[{pair_prefix}] 시장가 불가능(-4131). MarkPrice ±1% IOC 지정가로 폴백: {symbol}")
                         mark_price = float(pos.get("markPrice", 0) or pos.get("info", {}).get("markPrice", 0))
                         if mark_price <= 0:
