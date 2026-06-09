@@ -220,7 +220,7 @@ SCAN_FETCH_DELAY    = 0.3      # 코인별 fetch_ohlcv 호출 간 딜레이 (초
 
 # ── 다이내믹 포트폴리오 스캐너 설정 ──────────────────────────────────────────
 # 2시간마다 전체 선물 시장에서 최적 Top 15 페어를 자동 발굴하는 백그라운드 파이프라인
-SCANNER_INTERVAL_HOURS = 2        # 스캔 주기 (시간)
+SCANNER_INTERVAL_HOURS = 4        # 스캔 주기 (시간)
 SCANNER_TOP_N_COINS = 60          # Step 1: 24h 거래대금 상위 N개 코인
 SCANNER_CORR_THRESHOLD = 0.7      # Step 3: 피어슨 상관계수 최소값
 SCANNER_COINT_PVALUE = 0.05       # Step 4: 공적분 검정 p-value 최대값
