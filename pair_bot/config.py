@@ -236,11 +236,18 @@ SCANNER_EXCLUDE_COINS = {
     "USDC", "BUSD", "TUSD", "FDUSD", "DAI", "USDD", "EUR", "USDP",
     # 래핑/브릿지 토큰
     "WBTC", "WETH", "WBETH", "STETH", "CBETH",
-    # 주식/ETF (바이낸스 테스트넷에 간혹 등장)
+    # 주식/ETF/상품 (Commodities & Stocks)
     "SOXL", "QQQ", "INTC", "EWY", "SKHYNIX", "AAPL", "TSLA",
     "AMZN", "MSFT", "GOOG", "NVDA", "META", "NFLX", "AMD",
+    "XAU", "PAXG", "XAG", "CL", "BZ", "MRVL", "LITE", "MSTR",
+    "SAHARA", "SLX", "SIREN", "BTW", "CBRS", "SENT", "POWER", "GWEI",
+    "HOME", "SKYAI", "ALLO", "LAB", "MU", "DRAM", "BEAT", "BLESS",
+    "VELVET", "PIPPIN", "OPN", "MOVE", "HYPE", "LIT", "SPY",
     # 테스트넷/데모 전용 토큰
-    "CRCL", "PUMP", "ONDO",
+    "CRCL", "PUMP", "ONDO", "USDC", "BUSD", "TUSD", "FDUSD", "DAI",
+    "USDD", "EUR", "USDP",
+    # 래핑/브릿지 토큰
+    "WBTC", "WETH", "WBETH", "STETH", "CBETH",
 }
 
 # ── 포트폴리오 분산 필터 ─────────────────────────────────────────────────────

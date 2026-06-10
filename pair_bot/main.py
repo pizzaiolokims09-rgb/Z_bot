@@ -1313,6 +1313,7 @@ async def dynamic_scanner_loop(
                     "adjustForTimeDifference": True,
                 },
                 "enableRateLimit": True,
+                "timeout": 30000,
             })
 
             try:

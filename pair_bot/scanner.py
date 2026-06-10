@@ -94,10 +94,17 @@ class DynamicScanner:
         24시간 거래대금(quoteVolume) 상위 N개 코인의 base 심볼을 반환합니다.
         스테이블코인, 레버리지 토큰, 주식/ETF, 특수문자 티커 등을 제외합니다.
         """
-        try:
-            tickers = await exchange.fetch_tickers()
-        except Exception as e:
-            logger.error(f"[DynScanner] 전체 티커 조회 실패: {e}")
+        tickers = None
+        for attempt in range(3):
+            try:
+                tickers = await exchange.fetch_tickers()
+                break
+            except Exception as e:
+                logger.warning(f"[DynScanner] 전체 티커 조회 실패 (시도 {attempt+1}/3): {e}")
+                await asyncio.sleep(2)
+                
+        if not tickers:
+            logger.error("[DynScanner] 전체 티커 조회 최종 실패")
             return []
 
         # USDT 페어만 추출 + 거래대금 기준 정렬

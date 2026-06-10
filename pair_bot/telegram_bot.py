@@ -24,7 +24,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.error import TelegramError
+from telegram.error import TelegramError, NetworkError
 
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, STOP_LOSS_COOLDOWN_SEC, SECTORS, ENTRY_MIN_CORRELATION
 from bot_state import BotState
@@ -635,6 +635,7 @@ class TelegramNotifier:
             scan_exchange = ccxt_async.binanceusdm({
                 "options": {"defaultType": "future", "adjustForTimeDifference": True},
                 "enableRateLimit": True,
+                "timeout": 30000,
             })
 
             scanner = PairScanner()
@@ -893,5 +894,5 @@ class TelegramNotifier:
                 write_timeout=60, 
                 connect_timeout=60
             )
-        except TelegramError as e:
-            logger.warning(f"[텔레그램] 전송 실패: {e}")
+        except (TelegramError, NetworkError) as e:
+            logger.warning(f"[텔레그램] 전송 실패(네트워크/타임아웃 등): {e}")
