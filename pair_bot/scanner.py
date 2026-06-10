@@ -97,6 +97,7 @@ class DynamicScanner:
         tickers = None
         for attempt in range(3):
             try:
+                await exchange.load_markets()
                 tickers = await exchange.fetch_tickers()
                 break
             except Exception as e:
@@ -117,16 +118,23 @@ class DynamicScanner:
 
             base = symbol.split("/")[0]
 
-            # 위생 필터 1: 영문 대문자 + 숫자만 허용 (하이픈, 밑줄, 한자, 공백 등 차단)
+            # 위생 필터 1: 기초 자산(Underlying Type)이 COIN(암호화폐)인지 확인 (주식/원자재 원천 차단)
+            market_info = exchange.markets.get(symbol, {})
+            underlying_type = market_info.get("info", {}).get("underlyingType", "COIN")
+            if underlying_type != "COIN":
+                logger.debug(f"[DynScanner] 비코인 자산(주식/원자재 등) 차단: {symbol} ({underlying_type})")
+                continue
+
+            # 위생 필터 2: 영문 대문자 + 숫자만 허용 (하이픈, 밑줄, 한자, 공백 등 차단)
             if not _VALID_BASE_RE.match(base):
                 hygiene_rejected += 1
                 continue
 
-            # 위생 필터 2: 블랙리스트 (스테이블, 주식, 테스트넷 토큰)
+            # 위생 필터 3: 블랙리스트 (스테이블, 테스트넷 토큰 등)
             if base in SCANNER_EXCLUDE_COINS:
                 continue
 
-            # 위생 필터 3: 레버리지 토큰 접미사
+            # 위생 필터 4: 레버리지 토큰 접미사
             if any(base.endswith(suffix) for suffix in
                    ("UP", "DOWN", "BULL", "BEAR")):
                 continue
