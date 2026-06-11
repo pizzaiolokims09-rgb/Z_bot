@@ -440,30 +440,57 @@ class OrderExecutor:
     async def chase_maker_order(
         self, symbol: str, pair_prefix: str,
         pos_info: dict = None,
+        shared: dict = None,
     ) -> dict:
         """
-        지정가 추적(Limit Order Chasing) 엔진.
+        지정가 추적(Limit Order Chasing) 엔진 — 페어 동행 청산 보장판.
 
-        1. 현재 포지션 수량/방향 조회
-        2. 최우선 호가(Best Bid/Ask)에 지정가(Post-Only) 주문
-        3. CHASE_INTERVAL_SEC초 대기 후 체결 여부 확인
-        4. 미체결 → 기존 주문 취소 → 변경된 최우선 호가로 재주문
-        5. 매 반복마다 새 호가 기준 예상 PnL 가계산
-           → MIN_CHASE_PROFIT_PCT 미만이면 추적 포기 (ABORTED)
-        6. CHASE_MAX_ITERATIONS 도달 시에도 수익 마지노선 체크 후
-           통과 시만 시장가 Fallback, 미통과 시 ABORTED
-        7. 100% Maker 체결 시 결과 반환
+        핵심 안전 규칙 (Legging Risk 방지):
+          1. 반대 레그가 먼저 체결되면 이 레그는 즉시 시장가로 동행 청산
+             (헷지가 깨진 단방향 노출을 유지하지 않음)
+          2. 반대 레그가 추적을 포기(ABORT)하면 이 레그도 함께 포기 (협조 Hold)
+          3. ABORT는 양 레그 모두 완전 미체결일 때만 허용
+          4. 부분 체결이 발생한 순간부터 ABORT 금지 → 잔량 끝까지 청산
+          5. 추적 중 발생한 모든 주문의 realizedPnl/fee를 누락 없이 합산
 
-        pos_info: 외부에서 전달하는 포지션 정보 딕셔너리
-          {
-            "entry_price_a", "entry_price_b", "margin_a", "margin_b",
-            "qty_a", "qty_b", "side", "leg": "A"|"B"
-          }
+        shared: close_pair_chase가 주입하는 레그 간 공유 상태
+          {"filled": {"A": bool, "B": bool},
+           "aborted": {"A": bool, "B": bool},
+           "px": {"A": float|None, "B": float|None}}
 
         반환값:
-          - 체결 성공: {"average":..., "qty":..., "maker":True, ...}
-          - 추적 포기: {"status": "ABORTED", "reason": "..."}
+          - 체결 성공: {"average":..., "qty":..., "maker":..., ...}
+          - 추적 포기: {"status": "ABORTED", "reason": "..."}  (양 레그 미체결일 때만)
         """
+        leg = (pos_info or {}).get("leg", "")
+        other_leg = "B" if leg == "A" else "A"
+
+        def _other_filled() -> bool:
+            return bool(shared and leg and shared["filled"].get(other_leg))
+
+        def _other_aborted() -> bool:
+            return bool(shared and leg and shared["aborted"].get(other_leg))
+
+        def _mark_filled():
+            if shared and leg:
+                shared["filled"][leg] = True
+
+        def _mark_aborted():
+            if shared and leg:
+                shared["aborted"][leg] = True
+
+        current_order_id = None
+        placed_order_ids: list = []
+        partial_filled = False
+
+        async def _force_market_close() -> dict:
+            """시장가 동행 청산 + 추적 중 부분 체결분 합산."""
+            result = await self._close_real_position(symbol, pair_prefix)
+            _mark_filled()
+            return await self._finalize_with_partials(
+                symbol, placed_order_ids, result, pair_prefix
+            )
+
         try:
             # 포지션 조회
             positions = await asyncio.get_running_loop().run_in_executor(
@@ -473,6 +500,7 @@ class OrderExecutor:
             contracts = abs(float(pos.get("contracts", 0)))
             if contracts == 0:
                 logger.info(f"[{pair_prefix}] [Chasing] {symbol} 보유 없음, 스킵")
+                _mark_filled()  # 이 레그는 이미 닫힘 → 반대 레그도 동행 청산하도록 신호
                 return {"symbol": symbol, "average": 0.0, "fee": 0.0,
                         "qty": 0.0, "side": "", "maker": True}
 
@@ -486,13 +514,46 @@ class OrderExecutor:
                 amt = float(pos.get("info", {}).get("positionAmt", 0))
                 close_side = "sell" if amt > 0 else "buy"
 
-            current_order_id = None
+            remaining = contracts
 
             for iteration in range(1, CHASE_MAX_ITERATIONS + 1):
+                # ── 동행 규칙 1: 반대 레그 체결됨 → 즉시 시장가 동행 청산 ──
+                if _other_filled():
+                    filled_amt = await self._cancel_and_get_filled(current_order_id, symbol)
+                    if filled_amt > 0:
+                        partial_filled = True
+                    logger.warning(
+                        f"[{pair_prefix}] [Chasing 동행] {symbol} "
+                        f"반대 레그 체결 감지 → 즉시 시장가 동행 청산 (iter={iteration})"
+                    )
+                    return await _force_market_close()
+
+                # ── 동행 규칙 2: 반대 레그 포기 → 함께 포기 (헷지 유지 Hold) ──
+                if _other_aborted() and not partial_filled:
+                    filled_amt = await self._cancel_and_get_filled(current_order_id, symbol)
+                    if filled_amt > 0:
+                        # 취소 직전 체결 레이스 → 헷지 일부 붕괴, 시장가로 마저 청산
+                        partial_filled = True
+                        return await _force_market_close()
+                    logger.info(
+                        f"[{pair_prefix}] [Chasing 협조포기] {symbol} "
+                        f"반대 레그 ABORT → 함께 Hold (iter={iteration})"
+                    )
+                    _mark_aborted()
+                    return {
+                        "status": "ABORTED",
+                        "reason": "반대 레그 ABORT에 동조 (헷지 유지)",
+                        "symbol": symbol,
+                    }
+
                 # 오더북 조회 → 최우선 호가 결정
                 ob = await asyncio.get_running_loop().run_in_executor(
                     None, lambda: self._exchange.fetch_order_book(symbol, 5)
                 )
+                # 자기 레그 현재가(중간가)를 공유 상태에 게시 → 반대 레그 PnL 추정 정확도 확보
+                if shared and leg and ob.get("bids") and ob.get("asks"):
+                    shared["px"][leg] = (ob["bids"][0][0] + ob["asks"][0][0]) / 2.0
+
                 if close_side == "sell":
                     # Long 청산 → Best Ask에 Sell Limit
                     chase_price = ob["asks"][0][0] if ob.get("asks") else None
@@ -507,37 +568,39 @@ class OrderExecutor:
                     await asyncio.sleep(CHASE_INTERVAL_SEC)
                     continue
 
-                # ── 수익 마지노선 체크 (매 반복마다) ──
+                # ── 수익 마지노선 체크 (매 반복마다, 반대 레그 최신가 반영) ──
                 if pos_info:
+                    if shared and shared["px"].get(other_leg):
+                        # 트리거 시점 가격 고정 버그 수정: 반대 레그 실시간가로 갱신
+                        pos_info["current_price_other"] = shared["px"][other_leg]
                     estimated_pnl_pct = self._estimate_chase_pnl(
                         pos_info, symbol, chase_price
                     )
                     if estimated_pnl_pct < MIN_CHASE_PROFIT_PCT:
-                        # 추적 포기! 현재 걸려있는 주문 취소
-                        if current_order_id:
-                            try:
-                                await asyncio.get_running_loop().run_in_executor(
-                                    None, lambda: self._exchange.cancel_order(
-                                        current_order_id, symbol
-                                    )
-                                )
-                            except Exception:
-                                pass
+                        if _other_filled() or partial_filled:
+                            # 헷지가 이미 (일부) 깨짐 → 포기 불가, 시장가 동행
+                            await self._cancel_and_get_filled(current_order_id, symbol)
+                            return await _force_market_close()
+                        # 양 레그 모두 미체결 → 안전한 Hold
+                        filled_amt = await self._cancel_and_get_filled(current_order_id, symbol)
+                        if filled_amt > 0:
+                            partial_filled = True
+                            return await _force_market_close()
                         logger.warning(
                             f"[{pair_prefix}] [Chasing ABORT] {symbol} "
                             f"iter={iteration} | 예상 PnL={estimated_pnl_pct:+.2f}% "
                             f"< 마지노선 {MIN_CHASE_PROFIT_PCT}% → 추적 포기 (Hold)"
                         )
+                        _mark_aborted()
                         return {
                             "status": "ABORTED",
                             "reason": f"예상 PnL {estimated_pnl_pct:+.2f}% < {MIN_CHASE_PROFIT_PCT}%",
                             "symbol": symbol,
                         }
 
-                # 기존 미체결 주문이 있으면 취소
+                # 기존 미체결 주문이 있으면 체결 확인 후 취소
                 if current_order_id:
                     try:
-                        # 취소 전에 체결 여부 먼저 확인
                         fetched = await asyncio.get_running_loop().run_in_executor(
                             None, lambda: self._exchange.fetch_order(
                                 current_order_id, symbol
@@ -548,41 +611,64 @@ class OrderExecutor:
                                 f"[{pair_prefix}] [Chasing 체결] {symbol} "
                                 f"iter={iteration} Maker 체결! ({iteration * CHASE_INTERVAL_SEC:.0f}초 소요)"
                             )
-                            return await self._aggregate_trades_for_order(
-                                symbol, current_order_id, contracts,
+                            _mark_filled()
+                            return await self._aggregate_trades_for_orders(
+                                symbol, placed_order_ids, contracts,
                                 close_side, is_maker=True,
                                 pair_prefix=pair_prefix
                             )
-                        # 미체결 → 취소
+                        # 미체결 → 취소 (부분 체결량 반영)
                         await asyncio.get_running_loop().run_in_executor(
                             None, lambda: self._exchange.cancel_order(
                                 current_order_id, symbol
                             )
                         )
+                        filled_amt = float(fetched.get("filled") or 0)
+                        if filled_amt > 0:
+                            partial_filled = True
+                            remaining = max(0.0, remaining - filled_amt)
+                            if remaining <= contracts * 1e-6:
+                                # 사실상 전량 체결 완료
+                                _mark_filled()
+                                return await self._aggregate_trades_for_orders(
+                                    symbol, placed_order_ids, contracts,
+                                    close_side, is_maker=True,
+                                    pair_prefix=pair_prefix
+                                )
                     except Exception as e:
                         logger.debug(
                             f"[{pair_prefix}] [Chasing] 주문 취소/조회 오류: {e}"
                         )
+                    current_order_id = None
 
-                # 새 호가에 지정가 주문 (Post-Only)
+                # 새 호가에 지정가 주문 (Post-Only) — 잔량 기준
                 try:
                     order = await asyncio.get_running_loop().run_in_executor(
                         None,
                         lambda: self._exchange.create_order(
-                            symbol, "limit", close_side, contracts, chase_price,
+                            symbol, "limit", close_side, remaining, chase_price,
                             {"reduceOnly": True, "timeInForce": "GTX"}
                         )
                     )
                     current_order_id = order["id"]
+                    placed_order_ids.append(current_order_id)
                     logger.debug(
                         f"[{pair_prefix}] [Chasing] {symbol} {close_side} "
-                        f"{contracts:.4f} @ {chase_price:.4f} "
+                        f"{remaining:.4f} @ {chase_price:.4f} "
                         f"(iter={iteration}/{CHASE_MAX_ITERATIONS})"
                     )
                 except Exception as e:
                     if "-2022" in str(e) or "ReduceOnly Order is rejected" in str(e):
-                        logger.warning(f"[{pair_prefix}] [Chasing] {symbol} 이미 청산됨(-2022). 강제 성공 처리.")
-                        return {"symbol": symbol, "average": 0.0, "fee": 0.0, "qty": contracts, "side": close_side, "maker": False}
+                        # 포지션이 이미 닫힘 → 추적 중 부분 체결분을 실제 정산으로 합산
+                        logger.warning(
+                            f"[{pair_prefix}] [Chasing] {symbol} 이미 청산됨(-2022). "
+                            f"체결 내역 합산으로 정산."
+                        )
+                        _mark_filled()
+                        return await self._aggregate_trades_for_orders(
+                            symbol, placed_order_ids, contracts,
+                            close_side, is_maker=True, pair_prefix=pair_prefix
+                        )
                     # Post-Only 거부(이미 Taker 가격) 등 → 재시도
                     logger.debug(
                         f"[{pair_prefix}] [Chasing] 주문 실패 iter={iteration}: {e}"
@@ -592,7 +678,7 @@ class OrderExecutor:
                 # 체결 대기
                 await asyncio.sleep(CHASE_INTERVAL_SEC)
 
-                # 마지막 반복 후 체결 확인
+                # 반복 끝 체결 확인
                 if current_order_id:
                     try:
                         fetched = await asyncio.get_running_loop().run_in_executor(
@@ -605,29 +691,31 @@ class OrderExecutor:
                                 f"[{pair_prefix}] [Chasing 체결] {symbol} "
                                 f"Maker 체결 완료! (iter={iteration})"
                             )
-                            return await self._aggregate_trades_for_order(
-                                symbol, current_order_id, contracts,
+                            _mark_filled()
+                            return await self._aggregate_trades_for_orders(
+                                symbol, placed_order_ids, contracts,
                                 close_side, is_maker=True,
                                 pair_prefix=pair_prefix
                             )
                     except Exception:
                         pass
 
-            # ── 최대 추적 횟수 초과 → 최종 Fallback ──
-            # 미체결 주문 취소
-            if current_order_id:
-                try:
-                    await asyncio.get_running_loop().run_in_executor(
-                        None, lambda: self._exchange.cancel_order(
-                            current_order_id, symbol
-                        )
-                    )
-                except Exception:
-                    pass
+            # ── 최대 추적 횟수 초과 → 최종 처리 ──
+            filled_amt = await self._cancel_and_get_filled(current_order_id, symbol)
+            if filled_amt > 0:
+                partial_filled = True
+            current_order_id = None
 
-            # 최종 Fallback에서도 수익 마지노선 체크
+            # 헷지가 (일부) 깨졌으면 무조건 시장가 동행 청산
+            if _other_filled() or partial_filled:
+                logger.warning(
+                    f"[{pair_prefix}] [Chasing Fallback] {symbol} "
+                    f"{CHASE_MAX_ITERATIONS}회 초과 + 헷지 일부 붕괴 → 시장가 청산"
+                )
+                return await _force_market_close()
+
+            # 양 레그 모두 미체결 → 수익 마지노선 최종 체크 후 시장가 or Hold
             if pos_info:
-                # 현재 시장 중간가 기준으로 PnL 재계산
                 ob = await asyncio.get_running_loop().run_in_executor(
                     None, lambda: self._exchange.fetch_order_book(symbol, 5)
                 )
@@ -637,6 +725,8 @@ class OrderExecutor:
                     fb_price = ob["asks"][0][0] if ob.get("asks") else 0
 
                 if fb_price > 0:
+                    if shared and shared["px"].get(other_leg):
+                        pos_info["current_price_other"] = shared["px"][other_leg]
                     fb_pnl_pct = self._estimate_chase_pnl(
                         pos_info, symbol, fb_price
                     )
@@ -647,6 +737,7 @@ class OrderExecutor:
                             f"{fb_pnl_pct:+.2f}% < {MIN_CHASE_PROFIT_PCT}% "
                             f"→ 시장가도 포기, Hold"
                         )
+                        _mark_aborted()
                         return {
                             "status": "ABORTED",
                             "reason": f"최종 Fallback PnL {fb_pnl_pct:+.2f}% < {MIN_CHASE_PROFIT_PCT}%",
@@ -658,28 +749,120 @@ class OrderExecutor:
                 f"[{pair_prefix}] [Chasing Fallback] {symbol} "
                 f"{CHASE_MAX_ITERATIONS}회 초과 → 수익 마지노선 통과, 시장가 청산"
             )
-            return await self._close_real_position(symbol, pair_prefix)
+            return await _force_market_close()
 
         except Exception as e:
             logger.error(
                 f"[{pair_prefix}] [Chasing 예외] {symbol}: {e}"
             )
             # 예외 시에도 미체결 주문 정리 시도
-            if current_order_id:
+            filled_amt = await self._cancel_and_get_filled(current_order_id, symbol)
+            if filled_amt > 0:
+                partial_filled = True
+
+            # 헷지가 (일부) 깨진 상태면 Hold 불가 → 시장가 동행 청산 시도
+            if _other_filled() or partial_filled:
                 try:
-                    await asyncio.get_running_loop().run_in_executor(
-                        None, lambda: self._exchange.cancel_order(
-                            current_order_id, symbol
-                        )
+                    return await _force_market_close()
+                except Exception as e2:
+                    logger.critical(
+                        f"[{pair_prefix}] [Chasing 비상] {symbol} 동행 청산도 실패: {e2} "
+                        f"— 수동 확인 필요!"
                     )
-                except Exception:
-                    pass
-            # 예외 시 ABORTED 반환 (시장가로 긁지 않음)
+                    raise
+
+            # 양 레그 모두 미체결 → 안전한 Hold
+            _mark_aborted()
             return {
                 "status": "ABORTED",
                 "reason": f"Chasing 예외: {e}",
                 "symbol": symbol,
             }
+
+    async def _cancel_and_get_filled(self, order_id, symbol: str) -> float:
+        """
+        주문을 취소하고 누적 체결 수량을 반환합니다.
+        취소 직전에 체결되는 레이스를 취소 후 재조회로 보정합니다.
+        order_id가 None이거나 조회 실패 시 0.0 반환.
+        """
+        if not order_id:
+            return 0.0
+        filled = 0.0
+        try:
+            fetched = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._exchange.fetch_order(order_id, symbol)
+            )
+            filled = float(fetched.get("filled") or 0)
+            if fetched.get("status") == "closed":
+                return filled
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._exchange.cancel_order(order_id, symbol)
+            )
+            refetched = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._exchange.fetch_order(order_id, symbol)
+            )
+            filled = float(refetched.get("filled") or filled)
+        except Exception:
+            pass
+        return filled
+
+    async def _finalize_with_partials(
+        self, symbol: str, placed_order_ids: list,
+        market_result: dict, pair_prefix: str = "",
+    ) -> dict:
+        """
+        시장가 청산 결과에 추적 중 발생한 Maker 부분 체결분을 합산합니다.
+        (부분 체결 PnL 누락 방지)
+        """
+        if not placed_order_ids:
+            return market_result
+        maker_part = await self._aggregate_trades_for_orders(
+            symbol, placed_order_ids, 0.0, market_result.get("side", ""),
+            is_maker=True, pair_prefix=pair_prefix,
+        )
+        if maker_part.get("qty", 0.0) <= 0:
+            return market_result
+        return self._merge_close_results(maker_part, market_result)
+
+    @staticmethod
+    def _merge_close_results(res_x: dict, res_y: dict) -> dict:
+        """두 청산 결과(부분 체결 + 시장가 잔량)를 하나로 병합합니다."""
+        qty_x = float(res_x.get("qty", 0.0) or 0.0)
+        qty_y = float(res_y.get("qty", 0.0) or 0.0)
+        if qty_x <= 0:
+            return res_y
+        if qty_y <= 0:
+            return res_x
+
+        qty = qty_x + qty_y
+        avg_x = float(res_x.get("average", 0.0) or 0.0)
+        avg_y = float(res_y.get("average", 0.0) or 0.0)
+        if avg_x > 0 and avg_y > 0:
+            average = (avg_x * qty_x + avg_y * qty_y) / qty
+        else:
+            average = avg_y or avg_x
+
+        rp_x = res_x.get("total_realized_pnl")
+        rp_y = res_y.get("total_realized_pnl")
+        tf_x = res_x.get("total_fee")
+        tf_y = res_y.get("total_fee")
+
+        return {
+            "symbol": res_y.get("symbol") or res_x.get("symbol"),
+            "average": average,
+            "qty": qty,
+            "side": res_y.get("side") or res_x.get("side"),
+            "maker": False,  # 혼합 체결
+            "fee": float(res_x.get("fee", 0.0) or 0.0) + float(res_y.get("fee", 0.0) or 0.0),
+            "total_realized_pnl": (
+                float(rp_x) + float(rp_y)
+                if (rp_x is not None and rp_y is not None) else None
+            ),
+            "total_fee": (
+                float(tf_x) + float(tf_y)
+                if (tf_x is not None and tf_y is not None) else None
+            ),
+        }
 
     def _estimate_chase_pnl(
         self, pos_info: dict, symbol: str, chase_price: float
@@ -751,10 +934,18 @@ class OrderExecutor:
 
         반환: (result_a, result_b)
           - 각 result가 {"status": "ABORTED"} 이면 해당 레그 추적 포기
+            (협조 규칙상 ABORT는 양 레그 모두 미체결일 때만 발생)
         """
         logger.info(
             f"[{pair_prefix}] [Maker-Chasing 청산] A={sym_a}, B={sym_b}"
         )
+
+        # 레그 간 공유 상태: 체결/포기 신호 + 실시간 중간가 (동행 청산 협조용)
+        chase_shared = {
+            "filled":  {"A": False, "B": False},
+            "aborted": {"A": False, "B": False},
+            "px":      {"A": None, "B": None},
+        }
 
         if IS_PAPER_TRADING:
             pos_a = self._paper.positions.get(sym_a, {})
@@ -777,11 +968,42 @@ class OrderExecutor:
             )
 
         results = await asyncio.gather(
-            self.chase_maker_order(sym_a, pair_prefix, pos_info=pos_info_a),
-            self.chase_maker_order(sym_b, pair_prefix, pos_info=pos_info_b),
+            self.chase_maker_order(sym_a, pair_prefix, pos_info=pos_info_a, shared=chase_shared),
+            self.chase_maker_order(sym_b, pair_prefix, pos_info=pos_info_b, shared=chase_shared),
             return_exceptions=True,
         )
         return results
+
+    async def close_leg_market(self, symbol: str, pair_prefix: str = "") -> dict:
+        """
+        단일 레그 강제 시장가 청산 (공개 래퍼).
+        한쪽 레그만 체결되고 반대쪽이 포기한 헷지 붕괴 상태를 복구할 때 사용합니다.
+        """
+        return await self._close_real_position(symbol, pair_prefix)
+
+    async def fetch_funding_total(
+        self, symbols: list, since_ms: int, pair_prefix: str = ""
+    ) -> float:
+        """
+        since_ms 이후 심볼들의 펀딩비 합계(USDT)를 반환합니다.
+        음수 = 지불, 양수 = 수취. 조회 실패 시 해당 심볼은 0으로 처리.
+        """
+        if IS_PAPER_TRADING:
+            return 0.0
+        total = 0.0
+        for symbol in symbols:
+            try:
+                rows = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda s=symbol: self._exchange.fetch_funding_history(s, since=since_ms),
+                )
+                for r in rows or []:
+                    amt = r.get("amount")
+                    if amt is not None:
+                        total += float(amt)
+            except Exception as e:
+                logger.debug(f"[{pair_prefix}] 펀딩비 조회 실패 {symbol}: {e}")
+        return total
 
     # ── 내부 주문 처리 ────────────────────────────────────────────────────────
 
@@ -834,19 +1056,33 @@ class OrderExecutor:
         self, symbol: str, order_id: str, qty: float, side: str,
         is_maker: bool = False, pair_prefix: str = ""
     ) -> dict:
+        """단일 order_id의 모든 부분 체결을 합산합니다 (다중 버전에 위임)."""
+        return await self._aggregate_trades_for_orders(
+            symbol, [order_id], qty, side,
+            is_maker=is_maker, pair_prefix=pair_prefix,
+        )
+
+    async def _aggregate_trades_for_orders(
+        self, symbol: str, order_ids: list, qty: float, side: str,
+        is_maker: bool = False, pair_prefix: str = ""
+    ) -> dict:
         """
-        fetch_my_trades를 호출해 해당 order_id의 모든 부분 체결(Trade)을 합산합니다.
-        부분 체결이 여러 건이어도 realizedPnl과 fee를 누락 없이 누적합니다.
+        fetch_my_trades를 호출해 주어진 order_id들의 모든 부분 체결(Trade)을 합산합니다.
+        Chasing 중 여러 주문에 걸쳐 부분 체결이 발생해도 realizedPnl과 fee를 누락 없이 누적합니다.
         """
+        id_set = {oid for oid in (order_ids or []) if oid}
         try:
+            if not id_set:
+                return {"symbol": symbol, "average": 0.0, "fee": 0.0, "qty": qty, "side": side, "maker": is_maker, "total_realized_pnl": None, "total_fee": None}
+
             await asyncio.sleep(0.5)  # 거래소 정산 지연 대기
             trades = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: self._exchange.fetch_my_trades(symbol, limit=50)
             )
-            matched = [t for t in trades if t.get("order") == order_id]
+            matched = [t for t in trades if t.get("order") in id_set]
 
             if not matched:
-                logger.warning(f"[{pair_prefix}] fetch_my_trades에서 order_id={order_id} 매칭 없음 — 기본값 사용")
+                logger.warning(f"[{pair_prefix}] fetch_my_trades에서 order_ids={list(id_set)} 매칭 없음 — 기본값 사용")
                 return {"symbol": symbol, "average": 0.0, "fee": 0.0, "qty": qty, "side": side, "maker": is_maker, "total_realized_pnl": None, "total_fee": None}
 
             total_realized_pnl = 0.0
@@ -917,8 +1153,10 @@ class OrderExecutor:
                     )
                 except Exception as me:
                     if "-2022" in str(me) or "ReduceOnly Order is rejected" in str(me):
-                        logger.warning(f"[{pair_prefix}] [ReduceOnly 거절] {symbol} 이미 거래소에서 청산됨(-2022). 강제 성공 처리.")
-                        return {"symbol": symbol, "average": 0.0, "fee": 0.0, "qty": contracts, "side": close_side, "maker": False}
+                        # 이미 청산된 포지션 → 이 주문으로 체결된 수량은 0
+                        # (qty=contracts로 반환하면 PnL 계산에 유령 수량이 집계됨)
+                        logger.warning(f"[{pair_prefix}] [ReduceOnly 거절] {symbol} 이미 거래소에서 청산됨(-2022). 체결량 0으로 처리.")
+                        return {"symbol": symbol, "average": 0.0, "fee": 0.0, "qty": 0.0, "side": close_side, "maker": False}
                     elif "-4131" in str(me) or "PERCENT_PRICE" in str(me):
                         logger.warning(f"[{pair_prefix}] 시장가 불가능(-4131). MarkPrice ±1% IOC 지정가로 폴백: {symbol}")
                         mark_price = float(pos.get("markPrice", 0) or pos.get("info", {}).get("markPrice", 0))

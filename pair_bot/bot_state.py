@@ -26,6 +26,7 @@ class PairPosition:
     margin_b  : float     # B 레그 증거금 (USDT) - 변동성 가중치 기반
     entry_time: datetime = field(default_factory=datetime.now)  # 진입 시각 (KST)
     entry_z_score: float = 0.0                                  # 진입 시 Z-Score
+    entry_epoch: float = 0.0                                    # 진입 시각 (time.time() epoch, 펀딩비 조회용)
 
     @property
     def total_margin(self) -> float:

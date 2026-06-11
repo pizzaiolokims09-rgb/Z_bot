@@ -20,9 +20,13 @@ from config import (
     SCANNER_MAX_PAIRS,
     SCANNER_OHLCV_TIMEFRAME,
     SCANNER_OHLCV_LIMIT,
+    SCANNER_MIN_BARS,
     SCANNER_FETCH_DELAY,
     SCANNER_CHUNK_SIZE,
     SCANNER_EXCLUDE_COINS,
+    SCANNER_MIN_QUOTE_VOLUME,
+    SCANNER_MAX_SPREAD_BP,
+    SCANNER_MIN_SURVIVAL_SCANS,
     MAX_PAIRS_PER_COIN,
     SECTOR_MAP,
 )
@@ -38,20 +42,28 @@ class DynamicScanner:
     4단계 파이프라인으로 전체 바이낸스 선물 시장에서
     최적의 페어 트레이딩 후보를 자동 발굴합니다.
 
-    Step 1: 거래대금 상위 60개 우량주 필터 + 티커 위생 검사
-    Step 2: 15분봉 200개 OHLCV 데이터 수집
-    Step 3: 섹터 동조화 필터 + 피어슨 상관계수 >= 0.7 고속 필터
-    Step 4: 공적분 검정 p-value <= 0.05 오디션 + 코인 중복 제한 → Top 15 선발
+    Step 1: 거래대금 상위 우량주 필터 + 티커 위생/유동성 검사
+    Step 2: 1시간봉 500개(~21일) OHLCV 데이터 수집
+    Step 3: 섹터 동조화 필터 + 수익률 상관계수 >= 0.7 (양의 상관만)
+    Step 4: 로그가격 공적분 검정 p <= 0.01 오디션 + 코인 중복 제한
+    Step 5: 생존 필터 — N회 연속 스캔에서 발견된 페어만 최종 채택
     """
+
+    def __init__(self):
+        # 생존(지속성) 필터: {pair_key: 연속 발견 횟수}
+        # 진짜 공적분 관계는 스캔을 거듭해도 유지된다는 전제
+        self._survival_streaks: Dict[str, int] = {}
 
     # ── 메인 진입점 ───────────────────────────────────────────────────────────
 
     async def run_full_scan(self, exchange) -> List[dict]:
         """
-        4단계 파이프라인을 순차 실행하여 최종 Top N 페어를 반환합니다.
+        파이프라인을 순차 실행하여 최종 Top N 페어를 반환합니다.
 
-        반환: [{pair, sym_a, sym_b, corr, coint_pvalue, score, data_points}, ...]
+        반환: [{pair, sym_a, sym_b, corr, coint_pvalue, score, data_points,
+                survival_count}, ...]
               score 내림차순 정렬, 빈 리스트면 유효 페어 없음
+              (생존 필터로 SCANNER_MIN_SURVIVAL_SCANS회 연속 발견 페어만 포함)
         """
         # Step 1: 거래대금 상위 코인 필터
         top_coins = await self._fetch_top_coins(exchange, SCANNER_TOP_N_COINS)
@@ -77,11 +89,36 @@ class DynamicScanner:
         )
 
         # Step 3 + 4: CPU 연산을 별도 스레드에서 실행 (논블로킹)
-        results = await asyncio.to_thread(self._blocking_scan, prices)
+        candidates = await asyncio.to_thread(self._blocking_scan, prices)
         logger.info(
             f"[DynScanner] Step 3+4 완료 | "
-            f"최종 선발 {len(results)}개 페어"
+            f"통계 필터 통과 {len(candidates)}개 페어"
         )
+
+        # ── Step 5: 생존(지속성) 필터 ──
+        # 이번 스캔 후보의 streak 갱신, 미발견 페어 streak 초기화
+        current_keys = {c["pair"] for c in candidates}
+        new_streaks: Dict[str, int] = {}
+        for key in current_keys:
+            new_streaks[key] = self._survival_streaks.get(key, 0) + 1
+        self._survival_streaks = new_streaks
+
+        survivors = []
+        for c in candidates:
+            streak = self._survival_streaks[c["pair"]]
+            c["survival_count"] = streak
+            if streak >= SCANNER_MIN_SURVIVAL_SCANS:
+                survivors.append(c)
+
+        rookie_count = len(candidates) - len(survivors)
+        logger.info(
+            f"[DynScanner] Step 5 완료 | 생존 필터"
+            f"(>= {SCANNER_MIN_SURVIVAL_SCANS}회 연속) 통과: {len(survivors)}개 | "
+            f"검증 대기(첫 발견): {rookie_count}개"
+        )
+
+        # ── Step 6: 코인 분산 선발 (생존자 대상) ──
+        results = self._apply_diversity_filter(survivors)
         return results
 
     # ── Step 1: 거래대금 상위 코인 필터 ───────────────────────────────────────
@@ -139,9 +176,23 @@ class DynamicScanner:
                    ("UP", "DOWN", "BULL", "BEAR")):
                 continue
 
+            # 유동성 필터 1: 24h 거래대금 하한 (저유동성 = 슬리피지로 기대수익 잠식)
             quote_vol = float(ticker.get("quoteVolume", 0) or 0)
-            if quote_vol <= 0:
+            if quote_vol < SCANNER_MIN_QUOTE_VOLUME:
                 continue
+
+            # 유동성 필터 2: 호가 스프레드 상한 (bp)
+            # bid/ask가 티커에 없으면 통과시키되, 있으면 엄격 검사
+            bid = float(ticker.get("bid", 0) or 0)
+            ask = float(ticker.get("ask", 0) or 0)
+            if bid > 0 and ask > bid:
+                spread_bp = (ask - bid) / ((ask + bid) / 2) * 10_000
+                if spread_bp > SCANNER_MAX_SPREAD_BP:
+                    logger.debug(
+                        f"[DynScanner] 스프레드 과대 차단: {base} "
+                        f"({spread_bp:.1f}bp > {SCANNER_MAX_SPREAD_BP}bp)"
+                    )
+                    continue
 
             candidates.append((base, quote_vol))
 
@@ -185,7 +236,7 @@ class DynamicScanner:
                     ohlcv = await exchange.fetch_ohlcv(
                         symbol, timeframe=timeframe, limit=limit,
                     )
-                    if ohlcv and len(ohlcv) >= 100:
+                    if ohlcv and len(ohlcv) >= SCANNER_MIN_BARS:
                         closes = np.array(
                             [c[4] for c in ohlcv], dtype=np.float64
                         )
@@ -225,7 +276,6 @@ class DynamicScanner:
         이 함수는 동기 함수이며, asyncio.to_thread()로 별도 스레드에서 실행됩니다.
         """
         from statsmodels.tsa.stattools import coint
-        from collections import defaultdict
 
         coins = list(prices.keys())
         total_combos = len(coins) * (len(coins) - 1) // 2
@@ -234,15 +284,18 @@ class DynamicScanner:
             f"{len(coins)}개 코인 × {total_combos}개 조합"
         )
 
-        # ── Step 3: 섹터 동조화 필터 + 상관계수 고속 필터 ──
-        # 허용 조건: (1) 같은 섹터끼리 OR (2) 한쪽이 Macro(BTC/ETH)
+        # ── Step 3: 섹터 동조화 필터 + 수익률 상관계수 고속 필터 ──
+        # 허용 조건: (1) 같은 "분류된" 섹터끼리 OR (2) 한쪽이 Macro(BTC/ETH)
+        # ※ 미분류 코인(ETC)끼리는 차단 — ETC==ETC로 통과하던 구멍 봉쇄
+        # ※ 상관계수는 가격 레벨이 아닌 "로그 수익률"로 계산 (레벨 상관은 추세 오염)
+        # ※ 양의 상관만 허용 — 역상관 페어는 스마트 손절(corr 손절)과 모순되어 자동 손실
         corr_passed = []
         sector_skipped = 0
         for coin_a, coin_b in itertools.combinations(coins, 2):
             # 섹터 동조화 필터 (이종 교배 차단)
             sec_a = SECTOR_MAP.get(coin_a, "ETC")
             sec_b = SECTOR_MAP.get(coin_b, "ETC")
-            same_sector = (sec_a == sec_b)
+            same_sector = (sec_a == sec_b) and (sec_a != "ETC")
             has_macro = (sec_a == "Macro" or sec_b == "Macro")
             if not same_sector and not has_macro:
                 sector_skipped += 1
@@ -252,30 +305,35 @@ class DynamicScanner:
             arr_b = prices[coin_b]
 
             min_len = min(len(arr_a), len(arr_b))
-            if min_len < 100:
+            if min_len < SCANNER_MIN_BARS:
                 continue
             a = arr_a[-min_len:]
             b = arr_b[-min_len:]
+            if np.any(a <= 0) or np.any(b <= 0):
+                continue
 
-            corr = float(np.corrcoef(a, b)[0, 1])
-            if abs(corr) >= SCANNER_CORR_THRESHOLD:
+            # 로그 수익률 상관계수 (양의 상관만)
+            ret_a = np.diff(np.log(a))
+            ret_b = np.diff(np.log(b))
+            corr = float(np.corrcoef(ret_a, ret_b)[0, 1])
+            if corr >= SCANNER_CORR_THRESHOLD:
                 corr_passed.append((coin_a, coin_b, a, b, corr))
 
         logger.info(
             f"[DynScanner] Step 3 완료 | "
             f"섹터 필터로 {sector_skipped}개 이종 조합 차단 | "
-            f"상관계수 >= {SCANNER_CORR_THRESHOLD} 통과: "
+            f"수익률 상관계수 >= {SCANNER_CORR_THRESHOLD} 통과: "
             f"{len(corr_passed)}개 페어"
         )
 
         if not corr_passed:
             return []
 
-        # ── Step 4: 공적분 오디션 ──
+        # ── Step 4: 공적분 오디션 (로그 가격 기준) ──
         coint_candidates = []
         for coin_a, coin_b, a, b, corr in corr_passed:
             try:
-                _, pvalue, _ = coint(a, b)
+                _, pvalue, _ = coint(np.log(a), np.log(b))
                 pvalue = float(pvalue)
             except Exception:
                 continue
@@ -302,18 +360,28 @@ class DynamicScanner:
         coint_candidates.sort(key=lambda x: x["score"], reverse=True)
 
         logger.info(
-            f"[DynScanner] Step 4-A | "
+            f"[DynScanner] Step 4 완료 | "
             f"공적분 p<={SCANNER_COINT_PVALUE} 통과: "
             f"{len(coint_candidates)}개 후보"
         )
+        # 코인 분산 선발은 생존 필터 이후(run_full_scan)에서 수행
+        return coint_candidates
 
-        # ── 코인 중복 출현 제한 (포트폴리오 분산) ──
-        # score 순서대로 뽑되, 한 코인이 MAX_PAIRS_PER_COIN 초과하면 Skip
+    # ── 코인 중복 출현 제한 (포트폴리오 분산) ────────────────────────────────
+
+    @staticmethod
+    def _apply_diversity_filter(candidates: List[dict]) -> List[dict]:
+        """
+        score 순서대로 뽑되, 한 코인이 MAX_PAIRS_PER_COIN 초과하면 Skip.
+        내부용 키(coin_a, coin_b)를 제거한 최종 리스트를 반환합니다.
+        """
+        from collections import defaultdict
+
         coin_count: Dict[str, int] = defaultdict(int)
         results = []
         skipped_by_limit = 0
 
-        for cand in coint_candidates:
+        for cand in candidates:
             ca = cand["coin_a"]
             cb = cand["coin_b"]
 
@@ -336,9 +404,7 @@ class DynamicScanner:
                 break
 
         logger.info(
-            f"[DynScanner] Step 4-B 완료 | "
-            f"코인 분산 필터(MAX={MAX_PAIRS_PER_COIN})로 "
-            f"{skipped_by_limit}개 Skip | "
-            f"최종 {len(results)}개 선발"
+            f"[DynScanner] 분산 필터(MAX={MAX_PAIRS_PER_COIN}) | "
+            f"{skipped_by_limit}개 Skip | 최종 {len(results)}개 선발"
         )
         return results

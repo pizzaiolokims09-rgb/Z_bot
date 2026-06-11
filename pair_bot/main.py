@@ -30,7 +30,7 @@ from config import (
     WARMUP_BATCH_SIZE, EXIT_Z_SCORE, TARGET_NET_PNL_PCT,
     TAKER_FEE_RATE, MAKER_FEE_RATE,
     ENTRY_CONFIRMATION_SEC, MAX_LOSS_PCT,
-    CORR_WINDOW_MIN, CORR_STOP_THRESHOLD, STOP_LOSS_Z_SCORE,
+    CORR_WINDOW_MIN, CORR_STOP_THRESHOLD, CORR_STOP_MIN_SAMPLES, STOP_LOSS_Z_SCORE,
     ENTRY_MIN_CORRELATION,
     COINT_PVALUE_THRESHOLD, COINT_MIN_SAMPLES,
     SCANNER_INTERVAL_HOURS,
@@ -208,22 +208,42 @@ async def _execute_close(
             pos_info_a=pos_info_a, pos_info_b=pos_info_b,
         )
 
-        # ── ABORTED 처리: 한쪽이라도 추적 포기하면 청산 전체 포기 (Hold) ──
+        # ── ABORTED 처리 ──
+        # 협조 규칙상 ABORT는 양 레그 모두 미체결일 때만 발생해야 정상.
+        # 양쪽 모두 ABORT → 헷지 유지된 안전한 Hold.
+        # 한쪽만 ABORT + 반대쪽 체결 → 레이스로 헷지 붕괴! 포기한 레그 즉시 시장가 동행 청산.
         if results:
             a_aborted = isinstance(results[0], dict) and results[0].get("status") == "ABORTED"
             b_aborted = isinstance(results[1], dict) and results[1].get("status") == "ABORTED"
+            a_closed = isinstance(results[0], dict) and not a_aborted
+            b_closed = isinstance(results[1], dict) and not b_aborted
 
-            if a_aborted or b_aborted:
-                abort_reasons = []
-                if a_aborted:
-                    abort_reasons.append(f"A: {results[0].get('reason', '?')}")
-                if b_aborted:
-                    abort_reasons.append(f"B: {results[1].get('reason', '?')}")
+            if a_aborted and b_aborted:
                 logger.info(
-                    f"[{prefix}] Chasing ABORTED → 청산 포기, 포지션 유지(Hold) | "
-                    + " | ".join(abort_reasons)
+                    f"[{prefix}] Chasing 양 레그 ABORTED → 청산 포기, 포지션 유지(Hold) | "
+                    f"A: {results[0].get('reason', '?')} | B: {results[1].get('reason', '?')}"
                 )
-                return False  # ★ 청산 포기 — 포지션 유지
+                return False  # ★ 청산 포기 — 헷지 유지 상태로 다음 루프에서 재시도
+
+            if a_aborted and b_closed:
+                logger.warning(
+                    f"[{prefix}] 헷지 붕괴 감지! B 체결 + A 포기 → A 레그 즉시 시장가 동행 청산"
+                )
+                try:
+                    forced_a = await order_executor.close_leg_market(sym_a, prefix)
+                    results = (forced_a, results[1])
+                except Exception as e:
+                    results = (e, results[1])  # 아래 청산 실패 경로에서 알림 처리
+
+            elif b_aborted and a_closed:
+                logger.warning(
+                    f"[{prefix}] 헷지 붕괴 감지! A 체결 + B 포기 → B 레그 즉시 시장가 동행 청산"
+                )
+                try:
+                    forced_b = await order_executor.close_leg_market(sym_b, prefix)
+                    results = (results[0], forced_b)
+                except Exception as e:
+                    results = (results[0], e)  # 아래 청산 실패 경로에서 알림 처리
     else:
         results = await order_executor.close_pair(
             sym_a=sym_a, price_a=price_a,
@@ -276,6 +296,24 @@ async def _execute_close(
 
         res_a, res_b = results
         pnl_usdt, pnl_pct = bot_state.calc_pnl(pos, res_a, res_b)
+
+        # ── 펀딩비 반영 (보유 기간 동안 지불/수취한 펀딩 — 그동안 미집계였음) ──
+        if getattr(pos, "entry_epoch", 0.0) > 0:
+            try:
+                funding = await order_executor.fetch_funding_total(
+                    [sym_a, sym_b], int(pos.entry_epoch * 1000), prefix
+                )
+                if funding != 0.0:
+                    pnl_usdt += funding
+                    if pos.total_margin > 0:
+                        pnl_pct = pnl_usdt / pos.total_margin * 100
+                    logger.info(
+                        f"[{prefix}] 펀딩비 반영: {funding:+.4f} USDT → "
+                        f"최종 Net PnL={pnl_usdt:+.4f} USDT ({pnl_pct:+.3f}%)"
+                    )
+            except Exception as e:
+                logger.warning(f"[{prefix}] 펀딩비 반영 실패 (미반영 진행): {e}")
+
         bot_state.record_trade(pnl_usdt, prefix=prefix)
         bot_state.positions.pop(prefix, None)
 
@@ -543,29 +581,66 @@ async def pre_warmup_pair(
         return False
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 공유 코인 가드 — 활성 포지션과 코인이 겹치는 신규 진입 차단
+# ─────────────────────────────────────────────────────────────────────────────
+def _has_coin_overlap(bot_state: BotState, prefix: str, sym_a: str, sym_b: str) -> str | None:
+    """
+    바이낸스 원웨이 모드에서는 같은 심볼의 포지션이 상계(netting)되므로,
+    활성 포지션에 포함된 코인이 들어간 새 페어가 진입하면
+    봇 장부와 거래소 실제 포지션이 어긋난다 (-2022 ReduceOnly 거절의 원인).
+
+    겹치는 기존 페어의 prefix를 반환, 겹침 없으면 None.
+    """
+    my_bases = {sym_a.split("/")[0], sym_b.split("/")[0]}
+    for other_pf, other_pos in bot_state.positions.items():
+        if other_pf == prefix:
+            continue
+        other_bases = {
+            other_pos.sym_a.split("/")[0],
+            other_pos.sym_b.split("/")[0],
+        }
+        if my_bases & other_bases:
+            return other_pf
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 피어슨 상관계수 헬퍼 (스마트 손절용 — 유지)
 # ─────────────────────────────────────────────────────────────────────────────
 def calc_pearson_corr(prices_a: deque, prices_b: deque) -> float:
     """
-    두 가격 시계열의 피어슨 상관계수를 수동 계산합니다.
-    데이터가 부족하면(20개 미만) 1.0을 반환하여 손절을 방지합니다.
+    두 가격 시계열의 1분 '수익률' 피어슨 상관계수를 계산합니다.
+    가격 레벨 상관은 추세에 오염되어 커플링 판단에 무의미하므로
+    수익률 기반으로 측정합니다 (스마트 손절의 오발동 방지).
+    데이터가 부족하면 1.0을 반환하여 손절을 방지합니다.
     """
     n = min(len(prices_a), len(prices_b))
-    if n < 20:  # 최소 20분치 데이터가 있어야 유의미한 상관계수
+    if n < 21:  # 수익률 최소 20개 확보
         return 1.0
 
     a_list = list(prices_a)[-n:]
     b_list = list(prices_b)[-n:]
 
-    sum_a = sum(a_list)
-    sum_b = sum(b_list)
-    sum_ab = sum(a * b for a, b in zip(a_list, b_list))
-    sum_a2 = sum(a * a for a in a_list)
-    sum_b2 = sum(b * b for b in b_list)
+    # 1분 수익률 변환
+    ret_a, ret_b = [], []
+    for i in range(1, n):
+        if a_list[i - 1] > 0 and b_list[i - 1] > 0:
+            ret_a.append(a_list[i] / a_list[i - 1] - 1.0)
+            ret_b.append(b_list[i] / b_list[i - 1] - 1.0)
 
-    numerator = n * sum_ab - sum_a * sum_b
-    denom_a = n * sum_a2 - sum_a ** 2
-    denom_b = n * sum_b2 - sum_b ** 2
+    m = len(ret_a)
+    if m < 20:
+        return 1.0
+
+    sum_a = sum(ret_a)
+    sum_b = sum(ret_b)
+    sum_ab = sum(a * b for a, b in zip(ret_a, ret_b))
+    sum_a2 = sum(a * a for a in ret_a)
+    sum_b2 = sum(b * b for b in ret_b)
+
+    numerator = m * sum_ab - sum_a * sum_b
+    denom_a = m * sum_a2 - sum_a ** 2
+    denom_b = m * sum_b2 - sum_b ** 2
 
     if denom_a <= 0 or denom_b <= 0:
         return 1.0  # 분산이 0이면 상관계수 계산 불가 → 안전 반환
@@ -817,6 +892,16 @@ async def pair_loop(
                     await asyncio.sleep(POLL_INTERVAL_SEC)
                     continue
 
+                # 공유 코인 가드 — 활성 포지션과 코인이 겹치면 진입 금지 (포지션 상계 방지)
+                overlap_pf = _has_coin_overlap(bot_state, prefix, sym_a, sym_b)
+                if overlap_pf:
+                    entry_confirm_ts = 0.0
+                    logger.debug(
+                        f"[{prefix}] 진입 차단 — 활성 포지션 [{overlap_pf}]와 코인 중복"
+                    )
+                    await asyncio.sleep(POLL_INTERVAL_SEC)
+                    continue
+
                 # ── 진입 공적분 검정 사전 검증 (평균 회귀성 수학적 증명) ──────
                 coint_pvalue = calc_cointegration_pvalue(
                     corr_prices_a, corr_prices_b, min_samples=COINT_MIN_SAMPLES
@@ -885,6 +970,15 @@ async def pair_loop(
                         await asyncio.sleep(POLL_INTERVAL_SEC)
                         continue
 
+                    # 공유 코인 가드 재검증 (확인 대기 중 다른 페어가 진입했을 수 있음)
+                    overlap_pf = _has_coin_overlap(bot_state, prefix, sym_a, sym_b)
+                    if overlap_pf:
+                        logger.info(
+                            f"[{prefix}] 진입 직전 코인 중복 감지 — [{overlap_pf}]와 충돌, 스킵"
+                        )
+                        await asyncio.sleep(POLL_INTERVAL_SEC)
+                        continue
+
                     free_bal   = await order_executor.get_free_balance()
                     # 페어 총 배분 = 잔고 x 14% (두 레그 합산 총액)
                     total_margin = free_bal * ALLOCATION_PER_PAIR
@@ -893,8 +987,11 @@ async def pair_loop(
                         f"페어총액={total_margin:.2f} USDT (배분={ALLOCATION_PER_PAIR * 100:.0f}%)"
                     )
 
-                    # 변동성 가중치 계산 (워밍업 미완료 시 50:50 Fallback)
-                    vol_a, vol_b = spread_engine.get_volatilities()
+                    # ── 동일 명목가(50:50) 배분 ──
+                    # 진입 시그널(Z-Score)은 가격 비율 A/B 기준이므로,
+                    # 양 레그 명목가가 같아야 비율 회귀가 곧 PnL로 연결됨 (시장 중립).
+                    # 변동성 패리티는 순방향 노출(net exposure)을 남겨 폐기함.
+                    vol_a, vol_b = 1.0, 1.0
 
                     # ── 4. 신호 처리 (기존 진입 조건 로직 유지) ─────────────────
                     if signal == "ENTRY_SHORT_A_LONG_B" and total_margin > 0:
@@ -908,8 +1005,8 @@ async def pair_loop(
                             f"z={state['z_score']:+.3f} dev={dev:+.3f}%"
                         )
                         logger.info(
-                            f"[{prefix}] 변동성 헷징: vol_A={vol_a:.6f} vol_B={vol_b:.6f} | "
-                            f"배분 A={sizing['margin_a']:.1f} B={sizing['margin_b']:.1f} USDT"
+                            f"[{prefix}] 동일 명목가 배분: "
+                            f"A={sizing['margin_a']:.1f} B={sizing['margin_b']:.1f} USDT"
                         )
                         try:
                             await order_executor.open_pair(
@@ -930,6 +1027,7 @@ async def pair_loop(
                             margin_a=sizing['margin_a'], margin_b=sizing['margin_b'],
                             entry_time=_now_kst(),
                             entry_z_score=state["z_score"],
+                            entry_epoch=time.time(),
                         )
                         entry_timestamp = time.time()
                         await notifier.send_entry(
@@ -949,8 +1047,8 @@ async def pair_loop(
                             f"z={state['z_score']:+.3f} dev={dev:+.3f}%"
                         )
                         logger.info(
-                            f"[{prefix}] 변동성 헷징: vol_A={vol_a:.6f} vol_B={vol_b:.6f} | "
-                            f"배분 A={sizing['margin_a']:.1f} B={sizing['margin_b']:.1f} USDT"
+                            f"[{prefix}] 동일 명목가 배분: "
+                            f"A={sizing['margin_a']:.1f} B={sizing['margin_b']:.1f} USDT"
                         )
                         try:
                             await order_executor.open_pair(
@@ -971,6 +1069,7 @@ async def pair_loop(
                             margin_a=sizing['margin_a'], margin_b=sizing['margin_b'],
                             entry_time=_now_kst(),
                             entry_z_score=state["z_score"],
+                            entry_epoch=time.time(),
                         )
                         entry_timestamp = time.time()
                         await notifier.send_entry(
@@ -1062,7 +1161,9 @@ async def pair_loop(
                             qty_b = (pos.margin_b * LEVERAGE) / pos.price_b
                             entry_notional = (qty_a * pos.price_a) + (qty_b * pos.price_b)
                             exit_notional  = (qty_a * price_a) + (qty_b * price_b)
-                            total_fee = (entry_notional * TAKER_FEE_RATE) + (exit_notional * MAKER_FEE_RATE)
+                            # 청산도 Taker로 가정 (보수적): 마크가격-실체결가 갭과
+                            # 시장가 Fallback 가능성에 대한 버퍼 역할
+                            total_fee = (entry_notional + exit_notional) * TAKER_FEE_RATE
                             unrealized_net = gross_pnl - total_fee
                             total_margin   = pos.margin_a + pos.margin_b
                             unrealized_pct = (unrealized_net / total_margin * 100) if total_margin > 0 else 0.0
@@ -1126,10 +1227,10 @@ async def pair_loop(
                         await asyncio.sleep(POLL_INTERVAL_SEC)
                         continue
 
-                    # ── 우선순위 2: 스마트 손절 — 상관관계 붕괴 (corr <= 0) ──
-                    elif corr <= CORR_STOP_THRESHOLD and len(corr_prices_a) >= 20:
+                    # ── 우선순위 2: 스마트 손절 — 수익률 상관관계 붕괴 ──
+                    elif corr <= CORR_STOP_THRESHOLD and len(corr_prices_a) >= CORR_STOP_MIN_SAMPLES:
                         logger.warning(
-                            f"[{prefix}] 스마트 손절 발동! 단기 상관계수={corr:.4f} <= {CORR_STOP_THRESHOLD} "
+                            f"[{prefix}] 스마트 손절 발동! 단기 수익률 상관계수={corr:.4f} <= {CORR_STOP_THRESHOLD} "
                             f"(최근 {len(corr_prices_a)}분 데이터)"
                         )
                         await _execute_close(
@@ -1137,7 +1238,7 @@ async def pair_loop(
                             sym_a, sym_b, risk_manager, order_executor,
                             bot_state, notifier, logger, dev,
                             z_score=state["z_score"],
-                            close_reason=f"단기 상관관계 붕괴(corr={corr:.3f} <= 0) 손절",
+                            close_reason=f"수익률 상관관계 붕괴(corr={corr:.3f} <= {CORR_STOP_THRESHOLD}) 손절",
                         )
                         bot_state.cooldowns[prefix] = time.time()
                         bot_state.daily_stop_counts[prefix] = bot_state.daily_stop_counts.get(prefix, 0) + 1

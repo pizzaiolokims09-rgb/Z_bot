@@ -49,6 +49,7 @@ async def save_state(bot_state: BotState) -> None:
             "margin_b"     : pos.margin_b,
             "entry_time"   : _dt_to_str(pos.entry_time),
             "entry_z_score": pos.entry_z_score,
+            "entry_epoch"  : pos.entry_epoch,
         }
 
     # pending_swaps 직렬화: {prefix: [sym_a, sym_b]}
@@ -176,6 +177,7 @@ async def load_state(bot_state: BotState) -> bool:
                 margin_b     = m_b,
                 entry_time   = _str_to_dt(pd["entry_time"]),
                 entry_z_score= pd.get("entry_z_score", 0.0),
+                entry_epoch  = pd.get("entry_epoch", 0.0),
             )
 
         saved_at = data.get("saved_at", "알 수 없음")

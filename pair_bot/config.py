@@ -91,23 +91,26 @@ STOP_LOSS_PCT       = 2.0    # 2.0% — 고정 괴리율 손절 (1.5 → 2.0 상
 MIN_SPREAD_THRESHOLD = 2.5    # 2.5% — 잔파도 진입 원천 차단 (1.5 → 2.5 상향)
 
 EXIT_Z_SCORE       = 0.7    # |Z| <= 0.7 → 빠른 회전율 확보 (0.3 → 0.7 완화)
-STOP_LOSS_Z_SCORE  = 3.8    # |Z| >= 3.8 → 통계적 꼬리 끊기 (4.5 → 3.8 축소, 손익비 교정)
+STOP_LOSS_Z_SCORE  = 4.5    # |Z| >= 4.5 → 통계적 꼬리 끊기
+                            # (진입 z=2.5~3.0과 최소 1.5σ 간격 확보 — 3.8은 진입 직후 즉시 손절 유발)
 
 # ── 목표 순수익(Net PnL) 기반 익절 ────────────────────────────────────────────
 # Z-Score 회귀를 기다리지 않아도, 왕복 수수료 차감 후 순수익이
 # 이 비율(%)에 도달하면 즉시 전량 청산 (Take Profit)
 TARGET_NET_PNL_PCT = 3.5    # +3.5% 순수익 도달 시 익절
 
-# ── 하드 스탑 (Hard Stop) — 최대 허용 손실률 (손익비 1:1) ─────────────────────
+# ── 하드 스탑 (Hard Stop) — 최대 허용 손실률 ─────────────────────────────────
 # Z-Score 손절(STOP_LOSS_Z_SCORE)에 도달하지 않았더라도,
 # 실시간 미실현 순손실(Net PnL %)이 이 비율보다 더 내려가면 즉시 시장가 전량 손절
-MAX_LOSS_PCT = -12.0    # -12.0% 이하 시 하드 스탑 발동 (블랙스완 방어용)
+MAX_LOSS_PCT = -7.0    # -7.0% 이하 시 하드 스탑 발동 (꼬리 손실 차단: TP +3.5% 대비 1:2)
 
 # ── 스마트 손절: 단기 상관관계 붕괴 감지 ──────────────────────────────────────
-# 페어 두 코인의 최근 N분 1분봉 종가로 피어슨 상관계수를 실시간 계산
-# 상관계수가 임계치 이하(음수 = 역방향 진행)면 커플링 전제 붕괴로 즉시 손절
-CORR_WINDOW_MIN    = 60     # 상관계수 계산 윈도우 (60분)
-CORR_STOP_THRESHOLD = 0.0   # 상관계수가 이 값 이하면 스마트 손절 발동
+# 페어 두 코인의 최근 N분 1분봉 "수익률"로 피어슨 상관계수를 실시간 계산
+# (가격 레벨 상관은 추세에 오염되어 무의미 — 수익률 기반으로 측정)
+# 수익률 상관은 정상 페어도 0 근처를 오가므로, 뚜렷한 역방향(-0.25 이하)일 때만 손절
+CORR_WINDOW_MIN    = 60      # 상관계수 계산 윈도우 (60분)
+CORR_STOP_THRESHOLD = -0.25  # 수익률 상관계수가 이 값 이하면 스마트 손절 발동
+CORR_STOP_MIN_SAMPLES = 45   # 손절 판단에 필요한 최소 표본 수 (45분치)
 
 # ── 손절 후 재진입 쿨다운 ────────────────────────────────────────────────────
 # 손절 발생 후 동일 페어에 재진입하기까지 최소 대기 시간 (초)
@@ -164,8 +167,10 @@ MAKER_ORDER_TIMEOUT = 5   # 레거시: close_pair_limit()용 (하위 호환 유�
 # ── Maker-Chasing 엔진 설정 ─────────────────────────────────────────────────
 # 익절 시 최우선 호가를 추적하며 100% Maker 체결을 달성하는 비동기 루프
 CHASE_INTERVAL_SEC = 2.0       # 호가 추적 간격 (초)
-CHASE_MAX_ITERATIONS = 30      # 최대 추적 횟수 (30회 x 2초 = 최대 60초)
+CHASE_MAX_ITERATIONS = 10      # 최대 추적 횟수 (10회 x 2초 = 최대 20초)
+                               # 평균 회귀 전략은 TP 도달 순간부터 수익이 녹으므로 길게 끌면 안 됨
 MIN_CHASE_PROFIT_PCT = 0.5     # 추적 포기 마지노선: 예상 Net PnL이 이 % 미만이면 추적 중단 (Hold)
+                               # ※ 양 레그 모두 미체결일 때만 포기 가능 — 한쪽 체결 시 반대쪽 즉시 시장가 동행
 
 # ── 서버 재구동 시 상태 복구 파일 ────────────────────────────────────────────
 STATE_FILE = "bot_state.json"
@@ -219,16 +224,28 @@ SCAN_TIMEFRAME      = "1h"     # 스캔용 캔들 타임프레임
 SCAN_FETCH_DELAY    = 0.3      # 코인별 fetch_ohlcv 호출 간 딜레이 (초, Rate Limit 방어)
 
 # ── 다이내믹 포트폴리오 스캐너 설정 ──────────────────────────────────────────
-# 2시간마다 전체 선물 시장에서 최적 Top 15 페어를 자동 발굴하는 백그라운드 파이프라인
+# 주기적으로 전체 선물 시장에서 최적 Top 15 페어를 자동 발굴하는 백그라운드 파이프라인
 SCANNER_INTERVAL_HOURS = 4        # 스캔 주기 (시간)
 SCANNER_TOP_N_COINS = 60          # Step 1: 24h 거래대금 상위 N개 코인
-SCANNER_CORR_THRESHOLD = 0.7      # Step 3: 피어슨 상관계수 최소값
-SCANNER_COINT_PVALUE = 0.05       # Step 4: 공적분 검정 p-value 최대값
+SCANNER_CORR_THRESHOLD = 0.7      # Step 3: "수익률" 피어슨 상관계수 최소값 (양의 상관만 허용)
+SCANNER_COINT_PVALUE = 0.01       # Step 4: 공적분 검정 p-value 최대값
+                                  # (~1,700개 조합 다중비교 → 0.05는 우연 통과 ~88개. 0.01로 강화)
 SCANNER_MAX_PAIRS = 15            # 최종 선발 페어 수
-SCANNER_OHLCV_TIMEFRAME = "15m"   # Step 2: OHLCV 봉 주기 (15분봉)
-SCANNER_OHLCV_LIMIT = 200         # Step 2: OHLCV 봉 개수 (200개 = ~50시간)
+SCANNER_OHLCV_TIMEFRAME = "1h"    # Step 2: OHLCV 봉 주기 (1시간봉 — 50시간짜리 가짜 관계 차단)
+SCANNER_OHLCV_LIMIT = 500         # Step 2: OHLCV 봉 개수 (500개 = ~21일)
+SCANNER_MIN_BARS = 300            # 공적분 검정에 요구하는 최소 봉 수 (신규 상장 코인 차단)
 SCANNER_FETCH_DELAY = 0.3         # 코인별 fetch_ohlcv 호출 간 딜레이 (초)
 SCANNER_CHUNK_SIZE = 5            # OHLCV 수집 배치 크기 (한 번에 5개씩)
+
+# ── 스캐너 유동성 필터 ───────────────────────────────────────────────────────
+# 저유동성 코인은 시장가 슬리피지가 기대 수익(3.5%)을 통째로 잠식하므로 원천 차단
+SCANNER_MIN_QUOTE_VOLUME = 30_000_000  # 24h 거래대금 최소값 (USDT)
+SCANNER_MAX_SPREAD_BP = 10.0           # 호가 스프레드 최대 허용치 (bp, 0.1%)
+
+# ── 스캐너 지속성(생존) 필터 ─────────────────────────────────────────────────
+# 진짜 공적분 관계는 스캔을 거듭해도 유지됨 — N회 연속 스캔에서 발견된 페어만 채택
+# (1회짜리 우연 통과 페어 차단. 단, 봇 재시작 시 첫 유니버스 구축까지 N회 스캔 필요)
+SCANNER_MIN_SURVIVAL_SCANS = 2
 
 # 스캐너에서 제외할 코인 (스테이블코인, 레버리지 토큰, 래핑 토큰, 주식/ETF 등)
 SCANNER_EXCLUDE_COINS = {
@@ -239,15 +256,12 @@ SCANNER_EXCLUDE_COINS = {
     # 주식/ETF/상품 (Commodities & Stocks)
     "SOXL", "QQQ", "INTC", "EWY", "SKHYNIX", "AAPL", "TSLA",
     "AMZN", "MSFT", "GOOG", "NVDA", "META", "NFLX", "AMD",
-    "XAU", "PAXG", "XAG", "CL", "BZ", "MRVL", "LITE", "MSTR",
+    "XAU", "XAUT", "PAXG", "XAG", "CL", "BZ", "MRVL", "LITE", "MSTR",
     "SAHARA", "SLX", "SIREN", "BTW", "CBRS", "SENT", "POWER", "GWEI",
     "HOME", "SKYAI", "ALLO", "LAB", "MU", "DRAM", "BEAT", "BLESS",
     "VELVET", "PIPPIN", "OPN", "MOVE", "HYPE", "LIT", "SPY",
     # 테스트넷/데모 전용 토큰
-    "CRCL", "PUMP", "ONDO", "USDC", "BUSD", "TUSD", "FDUSD", "DAI",
-    "USDD", "EUR", "USDP",
-    # 래핑/브릿지 토큰
-    "WBTC", "WETH", "WBETH", "STETH", "CBETH",
+    "CRCL", "PUMP", "ONDO",
 }
 
 # ── 포트폴리오 분산 필터 ─────────────────────────────────────────────────────
