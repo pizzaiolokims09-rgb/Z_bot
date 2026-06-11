@@ -285,8 +285,7 @@ class DynamicScanner:
         )
 
         # ── Step 3: 섹터 동조화 필터 + 수익률 상관계수 고속 필터 ──
-        # 허용 조건: (1) 같은 "분류된" 섹터끼리 OR (2) 한쪽이 Macro(BTC/ETH)
-        # ※ 미분류 코인(ETC)끼리는 차단 — ETC==ETC로 통과하던 구멍 봉쇄
+        # 허용 조건: (1) 같은 섹터끼리 (ETC 포함) OR (2) 한쪽이 Macro(BTC/ETH)
         # ※ 상관계수는 가격 레벨이 아닌 "로그 수익률"로 계산 (레벨 상관은 추세 오염)
         # ※ 양의 상관만 허용 — 역상관 페어는 스마트 손절(corr 손절)과 모순되어 자동 손실
         corr_passed = []
@@ -295,7 +294,7 @@ class DynamicScanner:
             # 섹터 동조화 필터 (이종 교배 차단)
             sec_a = SECTOR_MAP.get(coin_a, "ETC")
             sec_b = SECTOR_MAP.get(coin_b, "ETC")
-            same_sector = (sec_a == sec_b) and (sec_a != "ETC")
+            same_sector = (sec_a == sec_b)
             has_macro = (sec_a == "Macro" or sec_b == "Macro")
             if not same_sector and not has_macro:
                 sector_skipped += 1

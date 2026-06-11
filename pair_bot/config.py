@@ -228,12 +228,11 @@ SCAN_FETCH_DELAY    = 0.3      # 코인별 fetch_ohlcv 호출 간 딜레이 (초
 SCANNER_INTERVAL_HOURS = 4        # 스캔 주기 (시간)
 SCANNER_TOP_N_COINS = 60          # Step 1: 24h 거래대금 상위 N개 코인
 SCANNER_CORR_THRESHOLD = 0.7      # Step 3: "수익률" 피어슨 상관계수 최소값 (양의 상관만 허용)
-SCANNER_COINT_PVALUE = 0.01       # Step 4: 공적분 검정 p-value 최대값
-                                  # (~1,700개 조합 다중비교 → 0.05는 우연 통과 ~88개. 0.01로 강화)
+SCANNER_COINT_PVALUE = 0.05       # Step 4: 공적분 검정 p-value 최대값
 SCANNER_MAX_PAIRS = 15            # 최종 선발 페어 수
 SCANNER_OHLCV_TIMEFRAME = "1h"    # Step 2: OHLCV 봉 주기 (1시간봉 — 50시간짜리 가짜 관계 차단)
 SCANNER_OHLCV_LIMIT = 500         # Step 2: OHLCV 봉 개수 (500개 = ~21일)
-SCANNER_MIN_BARS = 300            # 공적분 검정에 요구하는 최소 봉 수 (신규 상장 코인 차단)
+SCANNER_MIN_BARS = 200            # 공적분 검정에 요구하는 최소 봉 수 (신규 상장 코인 차단, ~8일)
 SCANNER_FETCH_DELAY = 0.3         # 코인별 fetch_ohlcv 호출 간 딜레이 (초)
 SCANNER_CHUNK_SIZE = 5            # OHLCV 수집 배치 크기 (한 번에 5개씩)
 
@@ -244,8 +243,8 @@ SCANNER_MAX_SPREAD_BP = 10.0           # 호가 스프레드 최대 허용치 (b
 
 # ── 스캐너 지속성(생존) 필터 ─────────────────────────────────────────────────
 # 진짜 공적분 관계는 스캔을 거듭해도 유지됨 — N회 연속 스캔에서 발견된 페어만 채택
-# (1회짜리 우연 통과 페어 차단. 단, 봇 재시작 시 첫 유니버스 구축까지 N회 스캔 필요)
-SCANNER_MIN_SURVIVAL_SCANS = 2
+# 1 = 첫 스캔부터 즉시 채택 (재시작 시 공백 없음)
+SCANNER_MIN_SURVIVAL_SCANS = 1
 
 # 스캐너에서 제외할 코인 (스테이블코인, 레버리지 토큰, 래핑 토큰, 주식/ETF 등)
 SCANNER_EXCLUDE_COINS = {
